@@ -225,13 +225,13 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/Users/liuhaoyu/iclr_2027/atpo/origin_dataset/merged_train_dataset.jsonl",
+        default="/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/merged_train_dataset.jsonl",
         help="Input JSONL file path (merged_train_dataset.jsonl from ATPO)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./data",
+        default="/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset",
         help="Output directory for parquet files",
     )
     parser.add_argument(

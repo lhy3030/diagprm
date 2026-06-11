@@ -17,8 +17,9 @@ set -e  # 遇到错误立即退出
 
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
 # 训练集：由 prepare_mediq_data.py 生成的 parquet 文件
-TRAIN_FILES="['./data/diagprm_train.parquet']"
-VAL_FILES="['./data/diagprm_val.parquet']"
+DIAGPRM_DATASET="${DIAGPRM_DATASET:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset}"
+TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
+VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
 # ── 目录设置 ──────────────────────────────────────────────────────────────────
 export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard}"
@@ -33,7 +34,7 @@ export ACTOR_LOAD="${ACTOR_LOAD:-/path/to/Qwen3-1.7B-Instruct}"
 
 # ── KG 路径（必填）──────────────────────────────────────────────────────────
 # master_kg.json 的绝对路径
-export KG_PATH="${KG_PATH:-/path/to/master_kg.json}"
+export KG_PATH="${KG_PATH:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/master_kg.json}"
 
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
