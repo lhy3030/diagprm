@@ -1,0 +1,5 @@
+- name: diagprm_interaction
+  _target_: recipe.diagprm.diagprm_agent_loop.DiagPRMAgentLoop
+  max_turns: 10
+  use_llm_patient: true
+  verifier_enabled: true

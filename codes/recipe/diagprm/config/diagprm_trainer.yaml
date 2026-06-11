@@ -1,0 +1,175 @@
+# DiagPRM Trainer Configuration
+# Turn-level GRPO with KG-driven process reward, no Critic
+
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - reward_model@reward_model: dp_reward_model
+  - _self_
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 600
+  model_type: qwen3
+
+  model:
+    # 修改为你的模型路径（如 Qwen3-8B-Instruct 或 Qwen3-14B-Instruct）
+    path: ~/models/Qwen3-8B-Instruct
+    custom_chat_template: null
+    use_shm: false
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: true
+    enable_activation_offload: false
+    use_remove_padding: true
+    lora_rank: 0
+    lora_alpha: 16
+    target_modules: all-linear
+    exclude_modules: null
+    use_liger: false
+    use_fused_kernels: false
+    fused_kernel_options:
+      impl_backend: torch
+    trust_remote_code: false
+
+  rollout:
+    enable_chunked_prefill: true
+    load_format: dummy_dtensor
+    layered_summon: false
+
+# ── Reward Manager（DiagPRM 核心）──────────────────────────────────────────────
+custom_reward_function:
+  path: null  # DiagPRM 使用内置 reward manager，不需要外部 reward fn
+  name: compute_score
+
+reward_model:
+  reward_manager: diagprm
+  loop_enable: false
+  # kg_path：master_kg.json 的绝对路径（必填）
+  # 也可在 run.sh 中通过 reward_model.kg_path=... 覆盖
+  kg_path: ""
+  reward_kwargs: {}
+
+# ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
+reward_coefficients:
+  beta: 1.0         # KG 覆盖率差分系数
+  gamma1: 0.3       # 假设正确性系数
+  lam: 0.5          # 切换修正系数
+  r_max: 2.0        # 最大确诊奖励
+  tau: 0.5          # 过早确诊 KG 覆盖率阈值
+  format_score: 0.1
+  weighted: true    # 是否使用加权 KG 覆盖率
+
+# ── Algorithm（Turn-level GRPO，无 Critic）────────────────────────────────────
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+
+  # 使用 diagprm_grpo 代替标准 grpo
+  # 支持值：grpo（标准轨迹级） / diagprm_grpo（turn级，本方法）
+  adv_estimator: diagprm_grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: false
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+
+# ── Critic（DiagPRM 不使用 Critic）──────────────────────────────────────────
+critic:
+  enable: false
+
+# ── Tree Search（禁用，DiagPRM 使用 flat rollout）─────────────────────────────
+tree_search:
+  M_trajectories: 1
+  N_candidates: 1
+  variance_threshold: 0.0
+  pruning_enabled: false
+  call_critic_enabled: false
+  only_use_critic_value: false
+  M_trajectories_eval: 1
+  N_candidates_eval: 1
+  variance_threshold_eval: null
+  pruning_enabled_eval: false
+  call_critic_enabled_eval: false
+
+extra_params:
+  use_critic_in_loop: false
+
+# ── Trainer ────────────────────────────────────────────────────────────────────
+trainer:
+  balance_batch: true
+  total_epochs: 3
+  total_training_steps: null
+  project_name: diagprm
+  experiment_name: diagprm_qwen3_8b
+  logger:
+    - console
+    - tensorboard
+  log_val_generations: 0
+  rollout_data_dir: null
+  validation_data_dir: null
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 10
+  esi_redundant_time: 0
+  resume_mode: auto
+  resume_from_path: null
+  val_before_train: true
+  val_only: false
+  test_freq: 10
+  critic_warmup: 0
+  default_hdfs_dir: null
+  del_local_ckpt_after_load: false
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+  use_legacy_worker_impl: auto
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: outputs/profile
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: false
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      context: "all"
+      stacks: "all"
+      kw_args: {}
+
+# ── Ray ────────────────────────────────────────────────────────────────────────
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null
