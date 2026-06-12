@@ -52,6 +52,10 @@ reward_model:
   # 也可在 run.sh 中通过 reward_model.kg_path=... 覆盖
   kg_path: ""
   reward_kwargs: {}
+  # DiagPRM 不使用 Critic，需显式覆盖这两个引用 ${critic.*} 的插值字段，
+  # 避免 OmegaConf 解析时报 InterpolationKeyError
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  forward_max_token_len_per_gpu: 32768
 
 # ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
 reward_coefficients:
@@ -91,8 +95,12 @@ algorithm:
     weight_pow: 2.0
 
 # ── Critic（DiagPRM 不使用 Critic）──────────────────────────────────────────
+# 即使不使用 Critic，reward_model.yaml 默认插值引用了 ${critic.use_dynamic_bsz}
+# 和 ${critic.forward_max_token_len_per_gpu}，需在此补充默认值防止解析报错
 critic:
   enable: false
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  forward_max_token_len_per_gpu: 32768
 
 # ── Tree Search（禁用，DiagPRM 使用 flat rollout）─────────────────────────────
 tree_search:
