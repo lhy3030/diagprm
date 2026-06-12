@@ -17,6 +17,13 @@
 
 set -e  # 遇到错误立即退出
 
+# ── 工作目录：确保在 codes/ 下运行，使 recipe 包可被 Python 发现 ───────────────
+# 本脚本位于 codes/recipe/diagprm/run_diagprm.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODES_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
+cd "${CODES_DIR}"
+
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
 # 训练集：由 prepare_mediq_data.py 生成的 parquet 文件
 DIAGPRM_DATASET="${DIAGPRM_DATASET:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset}"
