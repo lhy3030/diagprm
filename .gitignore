@@ -1,6 +1,5 @@
 # 排除数据集目录
 origin_dataset/
-dataset/
 diagprm_dataset/
 
 # Python
