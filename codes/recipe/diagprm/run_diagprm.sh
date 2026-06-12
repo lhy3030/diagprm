@@ -24,6 +24,17 @@ CODES_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
 cd "${CODES_DIR}"
 
+# ── 确保使用本地 verl 源码（而非 pip 安装的旧版）────────────────────────────────
+# pip install -e 会把旧的 site-packages 指针替换为本地路径，
+# 从而让 verl.experimental 等新模块生效
+VERL_LOCATION=$(python3 -c "import verl; print(verl.__file__)" 2>/dev/null || true)
+if [ -z "${VERL_LOCATION}" ] || [[ "${VERL_LOCATION}" != "${CODES_DIR}"* ]]; then
+    echo "[INFO] verl 当前路径: ${VERL_LOCATION:-未安装}"
+    echo "[INFO] 正在安装本地 verl 源码（pip install -e .）..."
+    pip install -e "${CODES_DIR}" --quiet --no-build-isolation
+    echo "[INFO] 本地 verl 安装完成"
+fi
+
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
 # 训练集：由 prepare_mediq_data.py 生成的 parquet 文件
 DIAGPRM_DATASET="${DIAGPRM_DATASET:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset}"
