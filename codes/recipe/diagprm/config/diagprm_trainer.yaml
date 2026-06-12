@@ -57,6 +57,7 @@ reward_model:
 reward_coefficients:
   beta: 1.0         # KG 覆盖率差分系数
   gamma1: 0.3       # 假设正确性系数
+  turn_coef: 1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
   lam: 0.5          # 切换修正系数
   r_max: 2.0        # 最大确诊奖励
   tau: 0.5          # 过早确诊 KG 覆盖率阈值
@@ -74,6 +75,9 @@ algorithm:
   adv_estimator: diagprm_grpo
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
+  # GiGPO 混合系数：Â(k) = Â_turn(k) + alpha * Â_diag
+  # alpha=0 → 纯 turn 级；alpha=1 → turn 级 + 等权轨迹级
+  diagprm_alpha: 0.5
   kl_penalty: kl
   kl_ctrl:
     _target_: verl.trainer.config.KLControlConfig
