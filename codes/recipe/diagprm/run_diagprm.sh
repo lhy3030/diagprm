@@ -74,12 +74,21 @@ actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * n_re
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 2 ))
 
 # ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
-beta=1.0       # KG 覆盖率差分系数
-gamma1=0.3     # 假设正确性系数
-lam=0.5        # 切换修正系数
-r_max=2.0      # 最大确诊奖励
-tau=0.5        # 过早确诊阈值
+# 奖励结构：r(k) = turn_coef * r_turn(k) + r_diag(k)
+#   r_turn(k) = format_reward + Δ_kg + r_hyp   （本轮即时信号，已去掉 r_switch）
+#   r_diag(k) = 确诊奖励（仅最后轮）
+beta=1.0         # KG 覆盖率差分系数（r_turn 内部）
+gamma1=0.3       # 假设正确性系数（r_turn 内部）
+turn_coef=1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
+r_max=2.0        # 最大确诊奖励
+tau=0.5          # 过早确诊阈值
 format_score=0.1
+
+# ── GiGPO 混合系数 ─────────────────────────────────────────────────────────────
+# Â(k) = Â_turn(k) + alpha * Â_diag
+#   alpha=0 → 纯 turn 级归一化（无轨迹级信号）
+#   alpha=1 → turn 级 + 等权轨迹级混合
+alpha=0.5
 
 echo "============================================================"
 echo "  DiagPRM Training"
@@ -156,11 +165,13 @@ python3 -m recipe.diagprm.diagprm_main \
     \
     reward_coefficients.beta=${beta} \
     reward_coefficients.gamma1=${gamma1} \
-    reward_coefficients.lam=${lam} \
+    reward_coefficients.turn_coef=${turn_coef} \
     reward_coefficients.r_max=${r_max} \
     reward_coefficients.tau=${tau} \
     reward_coefficients.format_score=${format_score} \
     reward_coefficients.weighted=True \
+    \
+    algorithm.diagprm_alpha=${alpha} \
     \
     critic.enable=False \
     \

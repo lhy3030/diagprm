@@ -5,7 +5,7 @@ DiagPRM - Multi-turn Diagnostic Dialogue Agent Loop
 
 对话协议（每轮）：
   Doctor  : <think>...</think><hypothesis_state>...</hypothesis_state>
-             <action>continue|switch|diagnose</action>
+             <action>continue|diagnose</action>
              <question>...</question>  或  <diagnosis>...</diagnosis>
   Patient : 根据原始症状列表（atomic_facts）回答医生的问题
 
@@ -273,14 +273,17 @@ class DiagPRMAgentLoop(AgentLoopBase):
         return "<Normal>"
 
     def _parse_action(self, doctor_response: str) -> Optional[str]:
-        """从 doctor 回复中解析 <action> 标签。"""
+        """从 doctor 回复中解析 <action> 标签。
+        动作空间： continue / diagnose（将旧的 switch 平滑合并为 continue）
+        """
         match = re.search(
             r'<action>\s*(continue|switch|diagnose)\s*</action>',
             doctor_response,
             re.IGNORECASE | re.DOTALL,
         )
         if match:
-            return match.group(1).strip().lower()
+            raw = match.group(1).strip().lower()
+            return "continue" if raw == "switch" else raw
         return None
 
     def _parse_question(self, doctor_response: str) -> Optional[str]:

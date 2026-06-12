@@ -19,7 +19,6 @@ KG 格式（master_kg.json）：
 import json
 import re
 import os
-from functools import lru_cache
 from typing import Dict, Set, Optional, List, Tuple
 
 
@@ -70,6 +69,22 @@ def _normalize(text: str) -> str:
 
 # ── 症状提取 ──────────────────────────────────────────────────────────────────
 
+# KG 症状池缓存（避免每次调用都遍历全 KG）
+# key: id(kg)，当 kg 对象未变时直接复用
+_SYMPTOMS_CACHE: Dict[int, frozenset] = {}
+
+
+def get_all_symptoms_from_kg(kg: Dict) -> frozenset:
+    """获取 KG 所有症状集合（带 id 缓存，避免 lru_cache 的 unhashable 问题）。"""
+    kg_id = id(kg)
+    if kg_id not in _SYMPTOMS_CACHE:
+        symptoms: Set[str] = set()
+        for sym_dict in kg.values():
+            symptoms.update(sym_dict.keys())
+        _SYMPTOMS_CACHE[kg_id] = frozenset(symptoms)
+    return _SYMPTOMS_CACHE[kg_id]
+
+
 def extract_symptoms_from_text(text: str, kg: Dict) -> Set[str]:
     """
     从文本中提取与 KG 已知症状匹配的词项。
@@ -87,24 +102,8 @@ def extract_symptoms_from_text(text: str, kg: Dict) -> Set[str]:
             ngrams.add(" ".join(tokens[i : i + n]))
 
     # 提取所有疾病的症状 key 集合（全 KG 症状池）
-    all_symptoms = _get_all_symptoms(kg)
+    all_symptoms = get_all_symptoms_from_kg(kg)
     return ngrams & all_symptoms
-
-
-@lru_cache(maxsize=1)
-def _get_all_symptoms(kg_frozenset) -> frozenset:
-    """返回 KG 中所有症状名（规范化）的集合，带缓存。"""
-    symptoms = set()
-    for sym_dict in kg_frozenset:
-        symptoms.update(sym_dict.keys())
-    return frozenset(symptoms)
-
-
-def get_all_symptoms_from_kg(kg: Dict) -> frozenset:
-    """获取 KG 所有症状集合（带缓存包装）。"""
-    # 把 kg 转成可哈希的结构供 lru_cache 使用
-    sym_items = tuple(frozenset(v.items()) for v in kg.values())
-    return _get_all_symptoms(sym_items)
 
 
 # ── 覆盖率计算 ─────────────────────────────────────────────────────────────────
@@ -191,14 +190,16 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
     if hyp_match:
         primary = _normalize(hyp_match.group(1))
 
-    # 解析 action
+    # 解析 action（动作空间已简化为 continue / diagnose，兼容旧的 switch 以平滑过渡）
     action_match = re.search(
         r'<action>\s*(continue|switch|diagnose)\s*</action>',
         model_output,
         re.IGNORECASE | re.DOTALL,
     )
     if action_match:
-        action = action_match.group(1).strip().lower()
+        raw_action = action_match.group(1).strip().lower()
+        # switch 已在新设计中合并入 continue：统一转换
+        action = "continue" if raw_action == "switch" else raw_action
 
     return primary, action
 

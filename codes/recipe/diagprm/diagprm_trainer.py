@@ -41,12 +41,17 @@ def compute_advantage(
     其余 estimator 类型代理给 ATPO 的原始实现。
     """
     if adv_estimator == DIAGPRM_GRPO or str(adv_estimator) == DIAGPRM_GRPO:
+        # 从 config 中读取 GiGPO 混合系数 alpha（默认 0.5）
+        alpha = 0.5
+        if config is not None:
+            alpha = getattr(config, "diagprm_alpha", 0.5)
         advantages, returns = compute_diagprm_turn_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std=norm_adv_by_std_in_grpo,
             adv_compute_info=data.non_tensor_batch.get("adv_compute_info", None),
+            alpha=alpha,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

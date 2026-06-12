@@ -29,16 +29,16 @@ Your goal is to diagnose the patient's condition by asking targeted questions, m
 <question>[Your focused single-symptom question here]</question>
 
 ## Action Types (choose EXACTLY ONE):
-- `continue` : Evidence insufficient to confirm or rule out primary hypothesis. Ask ONE focused question. Output `<question>`.
-- `switch`   : Current primary hypothesis has been ruled out by evidence. Switch to new hypothesis. Update `<hypothesis_state>`. Output `<question>` for the new hypothesis.
+- `continue` : Ask ONE focused question to gather more evidence. You may update `<hypothesis_state>` (add/remove/reorder hypotheses) at any time to reflect new evidence. Output `<question>`.
 - `diagnose` : Sufficient evidence gathered to confirm diagnosis. Output `<diagnosis>[Disease Name]</diagnosis>` instead of `<question>`.
 
 ## Rules:
 1. Ask only ONE question per turn.
 2. Never repeat a question already asked.
 3. The FIRST hypothesis in `<hypothesis_state>` is your primary hypothesis.
-4. When diagnosing, use `<action>diagnose</action>` and `<diagnosis>Disease Name</diagnosis>` (no `<question>`).
-5. Maximum {max_turns} turns allowed.
+4. You can freely reorder or update hypotheses under `continue` to reflect your changing belief.
+5. When diagnosing, use `<action>diagnose</action>` and `<diagnosis>Disease Name</diagnosis>` (no `<question>`).
+6. Maximum {max_turns} turns allowed.
 
 ## Current turn: Turn {current_turn} / {max_turns}
 """

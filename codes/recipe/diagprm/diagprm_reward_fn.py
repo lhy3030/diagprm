@@ -2,13 +2,12 @@
 DiagPRM - Turn-level Reward Function
 
 每一轮的 reward 由以下分量组成：
-  r(k) = Δ_k^kg  +  r_hyp(k)  +  r_switch(k)  +  r_diag（仅确诊轮）
+  r(k) = Δ_k^kg  +  r_hyp(k)  +  r_diag（仅确诊轮）
 
 各分量含义：
-  Δ_k^kg      : KG 覆盖率差分（dense，每轮都有）
-  r_hyp(k)    : 假设正确性奖励（每轮，感知主假设是否与 GT 一致）
-  r_switch(k) : 假设切换修正（稀疏，仅 <action>switch</action> 时触发）
-  r_diag      : 确诊奖励（仅 <action>diagnose</action> 时触发）
+  Δ_k^kg   : KG 覆盖率差分（dense，每轮都有）
+  r_hyp(k) : 假设正确性奖励（每轮，感知主假设是否与 GT 一致）
+  r_diag   : 确诊奖励（仅 <action>diagnose</action> 时触发）
 
 全部奖励来源于 KG 静态查询 + ground truth label，无需任何模型前向传播。
 """
@@ -118,27 +117,42 @@ def calculate_turn_reward(
     curr_collected_symptoms: Set[str],
     prev_hypothesis: Optional[str],   # 上一轮 primary hypothesis（规范化）
     curr_hypothesis: Optional[str],   # 本轮 primary hypothesis（规范化）
-    action: Optional[str],            # continue / switch / diagnose
+    action: Optional[str],            # continue / diagnose
     ground_truth_disease: str,        # 规范化的 GT 疾病名
     kg: Dict,
     is_final_turn: bool,
     # ---------- 奖励系数 ----------
-    beta: float = 1.0,     # KG 覆盖率差分系数
-    gamma1: float = 0.3,   # 假设正确性奖励系数
-    lam: float = 0.5,      # 切换修正系数
-    r_max: float = 2.0,    # 最大确诊奖励
-    tau: float = 0.5,      # 最低 KG 覆盖率阈值（过早确诊惩罚）
+    beta: float = 1.0,        # KG 覆盖率差分系数
+    gamma1: float = 0.3,      # 假设正确性奖励系数
+    turn_coef: float = 1.0,   # Turn 奖励总系数（r_turn 乘以该系数后加 r_diag）
+    r_max: float = 2.0,       # 最大确诊奖励
+    tau: float = 0.5,         # 最低 KG 覆盖率阈值（过早确诊惩罚）
     format_score: float = 0.1,
     weighted: bool = True,
 ) -> Dict:
     """
     计算单轮的完整 DiagPRM reward。
 
+    奖励结构：
+        r(k) = turn_coef * r_turn(k) + r_diag(k)
+
+    其中：
+        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
+          - format_reward : 输出格式正确奖励（含 <think> 且有合法 action）
+          - Δ_k^kg        : KG 覆盖率差分（本轮症状收集的增量贡献）
+          - r_hyp(k)      : 主假设是否指向 GT（每轮都有，假设更新隐含在 continue 中）
+
+        r_diag(k) : 确诊奖励（仅 is_final_turn 时非零）
+          - 正确诊断且覆盖率充分 : +r_max
+          - 正确诊断但覆盖率不足 : +r_max * 0.5（过早确诊）
+          - 诊断错误              : 0
+          - 超时未确诊            : -1.0
+
     Returns:
         dict with keys:
-          process_reward, outcome_reward,
-          delta_kg, r_hyp, r_switch, r_diag, format_reward,
-          details (各字段的细节)
+          total_reward, r_turn, r_diag,
+          format_reward, delta_kg, r_hyp,
+          details
     """
     gt_norm = _normalize(ground_truth_disease)
     details = {
@@ -147,11 +161,11 @@ def calculate_turn_reward(
         "prev_hypothesis": prev_hypothesis,
         "gt_disease": gt_norm,
         "has_valid_format": False,
+        "format_reward": 0.0,
         "delta_kg": 0.0,
         "r_hyp": 0.0,
-        "r_switch": 0.0,
+        "r_turn": 0.0,
         "r_diag": 0.0,
-        "format_reward": 0.0,
         "coverage_before": 0.0,
         "coverage_after": 0.0,
         "n_symptoms_collected": len(curr_collected_symptoms),
@@ -181,6 +195,7 @@ def calculate_turn_reward(
     details["delta_kg"] = delta_kg
 
     # ── 3. 假设正确性奖励 r_hyp ──────────────────────────────────────────────
+    # 每轮均感知主假设是否为 GT，假设切换隐含在 continue 动作内的 hypothesis_state 更新中
     r_hyp = 0.0
     if curr_hypothesis is not None:
         # 比较主假设与 GT（允许模糊包含匹配）
@@ -190,21 +205,14 @@ def calculate_turn_reward(
             r_hyp = -gamma1
     details["r_hyp"] = r_hyp
 
-    # ── 4. 假设切换修正 r_switch ─────────────────────────────────────────────
-    r_switch = 0.0
-    if action == "switch" and prev_hypothesis is not None and curr_hypothesis is not None:
-        prev_correct = gt_norm and (gt_norm in prev_hypothesis or prev_hypothesis in gt_norm)
-        curr_correct = gt_norm and (gt_norm in curr_hypothesis or curr_hypothesis in gt_norm)
-        if not prev_correct and curr_correct:
-            # 从错到对：好的切换
-            r_switch = lam
-        elif prev_correct and not curr_correct:
-            # 从对到错：坏的切换
-            r_switch = -lam
-        # 错到错或调整细节：0
-    details["r_switch"] = r_switch
+    # ── 4. 合并 Turn 奖励 ────────────────────────────────────────────────────
+    # r_turn 封装了本轮问诊质量的全部即时信号（去掉 r_switch）
+    r_turn = format_reward + delta_kg + r_hyp
+    details["r_turn"] = r_turn
 
     # ── 5. 确诊奖励 r_diag（仅 is_final_turn 时） ────────────────────────────
+    # 注意：action 到达此处时已经过归一化，只有 "continue" / "diagnose" / None 三种值
+    # （旧的 "switch" 在 parse_hypothesis_state 中已转换为 "continue"）
     r_diag = 0.0
     if is_final_turn:
         if action == "diagnose":
@@ -223,22 +231,24 @@ def calculate_turn_reward(
                 # 错误诊断
                 r_diag = 0.0
         else:
-            # 达到最大轮次但未确诊 → 惩罚
+            # 达到最大轮次仍是 continue / None（未触发 diagnose）→ 超时惩罚
             r_diag = -1.0
     details["r_diag"] = r_diag
 
-    # ── 6. 合并 ──────────────────────────────────────────────────────────────
-    process_reward = format_reward + delta_kg + r_hyp + r_switch
-    outcome_reward = r_diag  # 仅最终轮有效
+    # ── 6. 最终合并：r(k) = turn_coef * r_turn + r_diag ─────────────────────
+    total_reward = turn_coef * r_turn + r_diag
 
     return {
-        "process_reward": float(process_reward),
-        "outcome_reward": float(outcome_reward),
+        "total_reward": float(total_reward),      # r(k) 最终标量
+        "r_turn": float(r_turn),                  # 本轮即时信号合计
+        "r_diag": float(r_diag),                  # 确诊奖励（非最终轮为 0）
+        # 细项（供 metrics 展示）
         "format_reward": float(format_reward),
         "delta_kg": float(delta_kg),
         "r_hyp": float(r_hyp),
-        "r_switch": float(r_switch),
-        "r_diag": float(r_diag),
+        # 兼容旧接口（process_reward / outcome_reward 字段保留）
+        "process_reward": float(turn_coef * r_turn),
+        "outcome_reward": float(r_diag),
         "details": details,
     }
 
@@ -311,18 +321,22 @@ def compute_episode_rewards(
     reward_params: Dict,              # 奖励系数字典
 ) -> Tuple[List[float], List[float], List[Dict]]:
     """
-    对整条轨迹计算每轮的 process_reward 和 outcome_reward。
+    对整条轨迹计算每轮的 total_reward（含 turn_coef）和 r_diag。
+
+    奖励结构（每轮）：
+        r(k) = turn_coef * r_turn(k) + r_diag(k)
+        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
 
     Returns:
-        process_rewards: List[float]（每轮在 end_position 处的 process reward）
-        outcome_rewards: List[float]（非 0 值仅出现在 final turn）
-        details_list: List[Dict]
+        total_rewards : List[float]  每轮 r(k) = turn_coef * r_turn + r_diag
+        r_diag_list   : List[float]  每轮的确诊奖励（非最终轮为 0）
+        details_list  : List[Dict]
     """
     gt_norm = _normalize(ground_truth)
     collected_symptoms: Set[str] = set()
 
-    process_rewards = []
-    outcome_rewards = []
+    total_rewards = []
+    r_diag_list = []
     details_list = []
 
     prev_hypothesis: Optional[str] = None
@@ -345,7 +359,8 @@ def compute_episode_rewards(
                 collected_symptoms, human_resp, question or "", kg
             )
 
-        # 计算本轮 reward
+        # 计算本轮 reward（过滤掉 lam 参数，因为已去掉 r_switch）
+        _params = {k: v for k, v in reward_params.items() if k != "lam"}
         turn_result = calculate_turn_reward(
             model_response=model_response,
             human_response=human_resp,
@@ -357,14 +372,14 @@ def compute_episode_rewards(
             ground_truth_disease=gt_norm,
             kg=kg,
             is_final_turn=is_final,
-            **reward_params,
+            **_params,
         )
 
-        process_rewards.append(turn_result["process_reward"])
-        outcome_rewards.append(turn_result["outcome_reward"])
+        total_rewards.append(turn_result["total_reward"])
+        r_diag_list.append(turn_result["r_diag"])
         details_list.append(turn_result["details"])
 
         # 更新上一轮 hypothesis
         prev_hypothesis = curr_hypothesis
 
-    return process_rewards, outcome_rewards, details_list
+    return total_rewards, r_diag_list, details_list

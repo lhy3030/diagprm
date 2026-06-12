@@ -4,8 +4,7 @@ DiagPRM - Multi-Turn Reward Manager
 继承自 verl 的 AbstractRewardManager，重写 __call__ 以支持：
   1. Turn-level KG 覆盖率差分奖励
   2. 假设正确性奖励
-  3. 假设切换修正奖励
-  4. 确诊奖励（episode 末）
+  3. 确诊奖励（episode 末）
 
 奖励分配策略：
   - process_reward：放在该轮 end_position（密集信号）
@@ -37,7 +36,7 @@ class DiagPRMRewardManager(AbstractRewardManager):
       tokenizer       : HF tokenizer
       num_examine     : 日志中展示的样本数
       kg_path         : master_kg.json 路径
-      reward_params   : 各奖励系数字典（beta/gamma1/lam/r_max/tau 等）
+      reward_params   : 各奖励系数字典（beta/gamma1/r_max/tau 等）
     """
 
     def __init__(
@@ -55,11 +54,11 @@ class DiagPRMRewardManager(AbstractRewardManager):
 
         # 奖励系数（可通过 config.reward_coefficients 覆盖）
         self.reward_params = {
-            "beta": 1.0,      # KG 覆盖率差分系数
-            "gamma1": 0.3,    # 假设正确性系数
-            "lam": 0.5,       # 切换修正系数
-            "r_max": 2.0,     # 最大确诊奖励
-            "tau": 0.5,       # 过早确诊 KG 覆盖率阈值
+            "beta": 1.0,        # KG 覆盖率差分系数
+            "gamma1": 0.3,      # 假设正确性系数
+            "turn_coef": 1.0,   # Turn 奖励总系数：r(k) = turn_coef * r_turn + r_diag
+            "r_max": 2.0,       # 最大确诊奖励
+            "tau": 0.5,         # 过早确诊 KG 覆盖率阈值
             "format_score": 0.1,
             "weighted": True,
         }
@@ -134,13 +133,16 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 reward_extra_info["turn_count"].append(0)
                 reward_extra_info["process_rewards_sum"].append(0.0)
                 reward_extra_info["outcome_reward"].append(0.0)
-                reward_extra_info["adv_compute_info"].append(
-                    {"turn_end_positions": [], "turn_process_rewards": [], "outcome_reward": 0.0}
-                )
+                reward_extra_info["adv_compute_info"].append({
+                    "turn_end_positions": [],
+                    "turn_process_rewards": [],
+                    "outcome_reward": 0.0,
+                    "turn_hypotheses": [],   # 与正常路径保持一致
+                })
                 continue
 
-            # 计算每轮 reward
-            process_rewards, outcome_rewards, details_list = compute_episode_rewards(
+            # 计算每轮 reward：total_rewards[k] = turn_coef * r_turn(k) + r_diag(k)
+            total_rewards, r_diag_list, details_list = compute_episode_rewards(
                 turns_info=turns_info,
                 human_responses=human_responses,
                 ground_truth=ground_truth,
@@ -148,33 +150,43 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 reward_params=self.reward_params,
             )
 
-            # 将 reward 写入 tensor 的对应位置（end_position）
+            # 将 total_reward 写入 tensor 的对应位置（end_position）
+            # process_reward_tensor 存 turn_coef * r_turn（非最终轮的纯即时信号）
+            # outcome_reward_tensor 存 r_diag（仅最终轮）
             turn_end_positions = []
             for turn_idx, turn_info in enumerate(turns_info):
                 end_pos = turn_info["end_position"]
                 turn_end_positions.append(end_pos)
-                process_reward_tensor[i, end_pos] = float(process_rewards[turn_idx])
+                # total_reward = turn_coef * r_turn + r_diag，写入主 tensor
+                process_reward_tensor[i, end_pos] = float(total_rewards[turn_idx])
                 if turn_info["is_final_turn"]:
-                    outcome_reward_tensor[i, end_pos] = float(outcome_rewards[turn_idx])
+                    outcome_reward_tensor[i, end_pos] = float(r_diag_list[turn_idx])
 
             # 统计 metrics
-            total_process = sum(process_rewards)
-            final_outcome = outcome_rewards[-1] if outcome_rewards else 0.0
+            total_reward_sum = sum(total_rewards)
+            final_r_diag = r_diag_list[-1] if r_diag_list else 0.0
+            r_turn_list = [
+                d.get("r_turn", 0.0) for d in details_list
+            ]
             reward_extra_info["turn_count"].append(len(turns_info))
-            reward_extra_info["process_rewards_sum"].append(total_process)
-            reward_extra_info["process_rewards_mean"].append(
-                total_process / max(len(process_rewards), 1)
+            reward_extra_info["total_reward_sum"].append(total_reward_sum)
+            reward_extra_info["total_reward_mean"].append(
+                total_reward_sum / max(len(total_rewards), 1)
             )
-            reward_extra_info["outcome_reward"].append(final_outcome)
+            reward_extra_info["r_turn_sum"].append(sum(r_turn_list))
+            reward_extra_info["r_diag"].append(final_r_diag)
 
             # 详细 metrics
             self._update_detailed_metrics(details_list, reward_extra_info)
 
             # adv_compute_info 供 Turn-level GRPO 使用
+            # 传入 total_rewards（已含 turn_coef 系数）以及每轮的主假设（用于假设感知分组）
+            turn_hypotheses = [d.get("curr_hypothesis", "") or "" for d in details_list]
             reward_extra_info["adv_compute_info"].append({
                 "turn_end_positions": turn_end_positions,
-                "turn_process_rewards": process_rewards,
-                "outcome_reward": final_outcome,
+                "turn_process_rewards": total_rewards,  # r(k) = turn_coef*r_turn + r_diag
+                "outcome_reward": final_r_diag,
+                "turn_hypotheses": turn_hypotheses,     # 每轮的 primary hypothesis（假设感知分组用）
             })
 
         if return_dict:
@@ -194,9 +206,6 @@ class DiagPRMRewardManager(AbstractRewardManager):
         """统计每轮细节 metrics，写入 reward_extra_info。"""
         delta_kg_sum = 0.0
         r_hyp_sum = 0.0
-        r_switch_count = 0
-        correct_switches = 0
-        wrong_switches = 0
         n_valid_format = 0
         final_coverage = 0.0
         is_correct = False
@@ -204,12 +213,6 @@ class DiagPRMRewardManager(AbstractRewardManager):
         for idx, d in enumerate(details_list):
             delta_kg_sum += d.get("delta_kg", 0.0)
             r_hyp_sum += d.get("r_hyp", 0.0)
-            if d.get("action") == "switch":
-                r_switch_count += 1
-                if d.get("r_switch", 0.0) > 0:
-                    correct_switches += 1
-                elif d.get("r_switch", 0.0) < 0:
-                    wrong_switches += 1
             if d.get("has_valid_format"):
                 n_valid_format += 1
             if d.get("is_correct_diagnosis"):
@@ -219,13 +222,6 @@ class DiagPRMRewardManager(AbstractRewardManager):
         n = max(len(details_list), 1)
         reward_extra_info["delta_kg_sum"].append(delta_kg_sum)
         reward_extra_info["r_hyp_mean"].append(r_hyp_sum / n)
-        reward_extra_info["switch_count"].append(r_switch_count)
-        reward_extra_info["correct_switch_ratio"].append(
-            correct_switches / max(r_switch_count, 1)
-        )
-        reward_extra_info["wrong_switch_ratio"].append(
-            wrong_switches / max(r_switch_count, 1)
-        )
         reward_extra_info["valid_format_rate"].append(n_valid_format / n)
         reward_extra_info["final_kg_coverage"].append(final_coverage)
         reward_extra_info["is_correct"].append(1 if is_correct else 0)
