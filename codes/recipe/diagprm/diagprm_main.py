@@ -122,10 +122,14 @@ class DiagPRMTaskRunner:
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
+        # 新版 huggingface_hub 对 repo_id 格式有校验，不接受 /绝对路径 字符串。
+        # 传入 pathlib.Path 对象可绕过该校验，transformers 会将其识别为本地路径。
+        from pathlib import Path as _Path
+        local_path_obj = _Path(local_path).resolve()
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        tokenizer = hf_tokenizer(local_path_obj, trust_remote_code=trust_remote_code)
+        processor = hf_processor(local_path_obj, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Actor / Rollout Worker
         actor_rollout_cls, ray_worker_group_cls = self._add_actor_rollout_worker(config)
