@@ -19,7 +19,7 @@ set -e  # 遇到错误立即退出
 
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
 # 训练集：由 prepare_mediq_data.py 生成的 parquet 文件
-DIAGPRM_DATASET="${DIAGPRM_DATASET:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset}"
+DIAGPRM_DATASET="${DIAGPRM_DATASET:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset}"
 TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
 VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
@@ -30,18 +30,32 @@ export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm}"
 
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
-export ACTOR_LOAD="${ACTOR_LOAD:-/path/to/Qwen3-1.7B-Instruct}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/path/to/Qwen3-4B-Instruct}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/path/to/Qwen3-8B-Instruct}"
+export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B-Instruct}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-4B-Instruct}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B-Instruct}"
 
 # ── KG 路径（必填）──────────────────────────────────────────────────────────
 # master_kg.json 的绝对路径
-export KG_PATH="${KG_PATH:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/master_kg.json}"
+export KG_PATH="${KG_PATH:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset/master_kg.json}"
 
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
-export N_GPUS="${N_GPUS:-8}"
+export N_GPUS="${N_GPUS:-4}"
 export NODE_RANK="${NODE_RANK:-0}"
+
+# ── 4 卡自动适配 ──────────────────────────────────────────────────────────────
+# 当 N_GPUS=4 时，自动缩减 batch size / mini batch / agent workers
+if [ "${N_GPUS}" -le 4 ]; then
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=32}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=32}"
+    : "${AGENT_NUM_WORKERS_OVERRIDE:=4}"
+    : "${INFER_TP_OVERRIDE:=2}"
+else
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=64}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=64}"
+    : "${AGENT_NUM_WORKERS_OVERRIDE:=8}"
+    : "${INFER_TP_OVERRIDE:=2}"
+fi
 
 # ── Algorithm 超参 ─────────────────────────────────────────────────────────────
 # DiagPRM Turn-level GRPO：不使用 Critic，不使用 GAE
@@ -59,15 +73,15 @@ max_response_length=2048
 actor_lr=1e-6
 
 # ── 批量大小 ──────────────────────────────────────────────────────────────────
-train_batch_size=64
-ppo_mini_batch_size=64
+train_batch_size=${TRAIN_BATCH_SIZE_OVERRIDE}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE_OVERRIDE}
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
 n_resp_per_prompt=4    # 每个 prompt 采 G=4 条轨迹（Turn-level GRPO 需要）
 n_resp_per_prompt_val=1
 
 # ── 性能配置 ──────────────────────────────────────────────────────────────────
-infer_tp=2
+infer_tp=${INFER_TP_OVERRIDE}
 train_sp=1
 offload=True
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * n_resp_per_prompt ))
@@ -157,7 +171,7 @@ python3 -m recipe.diagprm.diagprm_main \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
     actor_rollout_ref.rollout.val_kwargs.n=${n_resp_per_prompt_val} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path='recipe/diagprm/diagprm_agent.yaml' \
-    actor_rollout_ref.rollout.agent.num_workers=8 \
+    actor_rollout_ref.rollout.agent.num_workers=${AGENT_NUM_WORKERS_OVERRIDE} \
     \
     reward_model.reward_manager=diagprm \
     reward_model.kg_path="${KG_PATH}" \
