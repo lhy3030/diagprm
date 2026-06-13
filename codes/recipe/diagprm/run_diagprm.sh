@@ -46,6 +46,11 @@ export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard}"
 export SAVE_CHECKPOINT_DIR="${SAVE_CHECKPOINT_DIR:-./checkpoints/diagprm}"
 export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm}"
 
+# HuggingFace / datasets 缓存目录（避免写入无权限的 /home/ubuntu/.cache）
+export HF_HOME="${HF_HOME:-${CODES_DIR}/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
 export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B}"
