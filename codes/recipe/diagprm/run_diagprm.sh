@@ -48,9 +48,9 @@ export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm}"
 
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
-export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B-Instruct}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-4B-Instruct}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B-Instruct}"
+export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-4B}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B}"
 
 # ── KG 路径（必填）──────────────────────────────────────────────────────────
 # master_kg.json 的绝对路径
