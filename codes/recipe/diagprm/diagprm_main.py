@@ -21,6 +21,22 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+# ── Monkey-patch: 新版 transformers 的 cached_files 在处理本地路径时仍会调用
+# huggingface_hub 的 try_to_load_from_cache，导致 repo-id 格式校验失败。
+# 用 os.path.isdir 提前短路，本地路径直接返回 None（让 transformers 走本地加载分支）。
+def _patch_transformers_local_path():
+    try:
+        import transformers.utils.hub as _hub
+        _orig = _hub._get_cache_file_to_return
+        def _patched(path_or_repo_id, filename, cache_dir=None, revision=None, repo_type=None):
+            if os.path.isdir(str(path_or_repo_id)):
+                return None
+            return _orig(path_or_repo_id, filename, cache_dir, revision, repo_type)
+        _hub._get_cache_file_to_return = _patched
+    except Exception:
+        pass
+_patch_transformers_local_path()
+
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.utils.device import is_cuda_available
@@ -122,14 +138,9 @@ class DiagPRMTaskRunner:
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
-        # 新版 huggingface_hub 对 repo_id 格式有校验，不接受 /绝对路径 字符串。
-        # 传入 pathlib.Path 对象可绕过该校验，transformers 会将其识别为本地路径。
-        from pathlib import Path as _Path
-        local_path_obj = _Path(local_path).resolve()
-
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path_obj, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path_obj, trust_remote_code=trust_remote_code, use_fast=True)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Actor / Rollout Worker
         actor_rollout_cls, ray_worker_group_cls = self._add_actor_rollout_worker(config)
