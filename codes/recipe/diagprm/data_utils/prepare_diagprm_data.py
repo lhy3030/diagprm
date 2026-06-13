@@ -360,9 +360,9 @@ def main():
     print("\n--- Sample Record ---")
     sample = train_records[0]
     print(f"Chief complaint (truncated): {sample['prompt'][1]['content'][:200]}...")
-    gt = json.loads(sample['reward_model'])['ground_truth']
+    gt = sample['reward_model']['ground_truth']
     print(f"GT disease: {gt['disease_raw']} -> normalized: {gt['disease']}")
-    print(f"n_atomic_facts: {gt['n_atomic_facts'] if 'n_atomic_facts' in gt else len(gt['atomic_facts'])}")
+    print(f"n_atomic_facts: {len(gt['atomic_facts'])}")
     print("Done!")
 
 
