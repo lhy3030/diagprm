@@ -18,6 +18,7 @@ import copy
 import logging
 import os
 import re
+import json
 from collections import defaultdict
 from typing import Optional
 
@@ -226,6 +227,13 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
+        # 兼容 parquet 文件中 JSON 字符串列（如 extra_info, reward_model 等）
+        for _key in list(row_dict.keys()):
+            if isinstance(row_dict[_key], str) and row_dict[_key].startswith(("{", "[")):
+                try:
+                    row_dict[_key] = json.loads(row_dict[_key])
+                except (json.JSONDecodeError, ValueError):
+                    pass
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
@@ -337,6 +345,11 @@ class RLHFDataset(Dataset):
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:
             row_dict["extra_info"] = dict()
+        elif isinstance(row_dict["extra_info"], str):
+            try:
+                row_dict["extra_info"] = json.loads(row_dict["extra_info"])
+            except (json.JSONDecodeError, ValueError):
+                row_dict["extra_info"] = dict()
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})

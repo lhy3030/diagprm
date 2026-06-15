@@ -68,6 +68,67 @@ def compute_advantage(
         )
 
 
+def _diagprm_compute_accuracy_metrics(batch):
+    """
+    DiagPRM 版本的 compute_accuracy_metrics。
+    
+    UserAssistantAgentLoop 版本的 compute_accuracy_metrics 需要 is_valid / is_correct
+    等字段，DiagPRM 的 reward manager 没有填充这些字段。
+    这里用一个兼容版本替换，从 DiagPRM 自有的 reward_extra_info 字段中计算 metrics。
+    """
+    non_tensor = batch.non_tensor_batch
+    n = len(batch)
+
+    # 从 DiagPRM reward_extra_info 中读取已有的指标（如果存在）
+    is_correct = non_tensor.get('is_correct', None)
+    if is_correct is not None:
+        num_correct = int(np.sum(is_correct))
+    else:
+        num_correct = 0
+
+    is_valid_arr = non_tensor.get('is_valid', None)
+    if is_valid_arr is not None:
+        num_valid = int(np.sum(is_valid_arr))
+    else:
+        num_valid = n  # DiagPRM 默认所有样本有效
+
+    valid_rate = num_valid / n if n > 0 else 0.0
+    accuracy_of_valid = num_correct / num_valid if num_valid > 0 else 0.0
+    is_correct_rate = num_correct / n if n > 0 else 0.0
+
+    # 从 DiagPRM 特有的 metrics 中读取
+    def _safe_mean(key):
+        arr = non_tensor.get(key, None)
+        if arr is not None and len(arr) > 0:
+            return float(np.mean(arr))
+        return 0.0
+
+    return {
+        "custom/num_sample": n,
+        "custom/num_valid": num_valid,
+        "custom/valid_rate": valid_rate,
+        "custom/num_correct": num_correct,
+        "custom/accuracy_of_valid": accuracy_of_valid,
+        "custom/incorrect_format_rate": 1.0 - _safe_mean('valid_format_rate'),
+        "custom/multiple_rate": 0.0,
+        "custom/repeated_rate": 0.0,
+        "custom/verify_timeout_rate": 0.0,
+        "custom/effective_rate": valid_rate,
+        "custom/human_reject_rate": 0.0,
+        "custom/human_timeout_rate": 0.0,
+        "custom/assistant_error_rate": 0.0,
+        "custom/is_correct": is_correct_rate,
+        # DiagPRM 特有 metrics
+        "diagprm/total_reward_mean": _safe_mean('total_reward_mean'),
+        "diagprm/r_diag_mean": _safe_mean('r_diag'),
+        "diagprm/turn_count_mean": _safe_mean('turn_count'),
+        "diagprm/final_kg_coverage_mean": _safe_mean('final_kg_coverage'),
+        "diagprm/valid_format_rate": _safe_mean('valid_format_rate'),
+        "diagprm/r_hyp_mean": _safe_mean('r_hyp_mean'),
+        "diagprm/delta_kg_sum_mean": _safe_mean('delta_kg_sum'),
+    }
+
+
 class DiagPRMTrainer(RayPPOTrainer):
     """
     DiagPRM 的 Trainer。
@@ -79,15 +140,19 @@ class DiagPRMTrainer(RayPPOTrainer):
     def fit(self):
         """
         训练主循环，与 ATPO RayPPOTrainer.fit() 完全相同，
-        唯一区别是 compute_advantage 调用使用本文件中的扩展版本。
+        唯一区别是 compute_advantage 调用使用本文件中的扩展版本，
+        且 compute_accuracy_metrics 使用 DiagPRM 兼容版本。
         
         实现策略：通过猴子补丁将 mt_trainer 模块中的 compute_advantage
         临时替换为扩展版本，确保整个 fit() 流程中都使用新的实现。
         """
         import recipe.atpo.mt_trainer as mt_trainer_module
-        _original = mt_trainer_module.compute_advantage
+        _original_adv = mt_trainer_module.compute_advantage
+        _original_acc = mt_trainer_module.compute_accuracy_metrics
         mt_trainer_module.compute_advantage = compute_advantage
+        mt_trainer_module.compute_accuracy_metrics = _diagprm_compute_accuracy_metrics
         try:
             super().fit()
         finally:
-            mt_trainer_module.compute_advantage = _original
+            mt_trainer_module.compute_advantage = _original_adv
+            mt_trainer_module.compute_accuracy_metrics = _original_acc

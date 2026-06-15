@@ -38,7 +38,10 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ImportError:
+        index_first_axis = pad_input = rearrange = unpad_input = None
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 

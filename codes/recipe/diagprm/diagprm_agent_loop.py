@@ -24,11 +24,10 @@ import re
 import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, convert_to_messages
 
-from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput
-from recipe.atpo.api_request_async import request_vllm_async
-from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError, convert_to_agent_output
+from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics
+from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError
 from recipe.diagprm.prompts import (
     DOCTOR_SYSTEM_PROMPT,
     DOCTOR_INITIAL_PROMPT,
@@ -58,44 +57,62 @@ class DiagPRMAgentLoop(AgentLoopBase):
       verifier_enabled    : 是否启用问题重复检测（default: True）
     """
 
-    def __init__(self, config: Dict, **kwargs):
-        super().__init__(config, **kwargs)
-        self.max_turns = config.get("max_turns", 10)
-        self.use_llm_patient = config.get("use_llm_patient", True)
-        self.verifier_enabled = config.get("verifier_enabled", True)
-        self.doctor_model = None  # 由 AgentLoopBase 的 set_model 设置
+    def __init__(self, trainer_config, server_manager, tokenizer, processor, **kwargs):
+        # kwargs 包含来自 diagprm_agent.yaml 的字段（max_turns, use_llm_patient, verifier_enabled）
+        super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
+        self.max_turns = kwargs.get("max_turns", 10)
+        self.use_llm_patient = kwargs.get("use_llm_patient", True)
+        self.verifier_enabled = kwargs.get("verifier_enabled", True)
 
-    async def run(
-        self,
-        chat_model: ChatModel,
-        initial_prompt: Dict,
-        ground_truth: Any = None,
-        extra_info: Dict = None,
-        **kwargs,
-    ) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict, **kwargs) -> list:
         """
         执行一轮完整的多轮诊断对话。
 
         Args:
-            chat_model    : verl 的 ChatModel 接口（调用 vLLM）
-            initial_prompt: 数据集中的 prompt（通常是主诉）
-            ground_truth  : {disease: str, atomic_facts: List[str]}
-            extra_info    : 数据集的 extra_info 字段
+            sampling_params: vLLM 采样参数
+            **kwargs: 来自数据集的字段（prompt, reward_model, extra_info, ...）
 
         Returns:
-            AgentLoopOutput：包含完整对话序列和 metadata
+            list[AgentLoopOutput]：包含完整对话序列和 token 信息的列表
         """
-        # 获取患者信息
-        if ground_truth is None:
-            ground_truth = {}
+        rollout = self.config.actor_rollout_ref.rollout
+        model_type = self.config.actor_rollout_ref.model_type
+
+        # 构建 ChatModel（与 UserAssistantAgentLoop 相同方式）
+        model = ChatModel(
+            model=model_type,
+            client=self.server_manager,
+            tokenizer=self.tokenizer,
+            max_tokens=rollout.response_length,
+        )
+
+        # 获取数据集字段
+        # prompt 是原始 chat messages（JSON 字符串或 list）
+        raw_prompt = kwargs.get("prompt", [])
+        if isinstance(raw_prompt, str):
+            try:
+                raw_prompt = json.loads(raw_prompt)
+            except Exception:
+                raw_prompt = []
+
+        # reward_model 包含 ground_truth（disease, atomic_facts）
+        reward_model = kwargs.get("reward_model", {})
+        if isinstance(reward_model, str):
+            try:
+                reward_model = json.loads(reward_model)
+            except Exception:
+                reward_model = {}
+        ground_truth = reward_model.get("ground_truth", {})
+
         disease = ground_truth.get("disease", "unknown")
         atomic_facts = ground_truth.get("atomic_facts", [])
-        chief_complaint = self._extract_chief_complaint(initial_prompt)
 
-        # 初始化对话历史
+        # 从 prompt 中提取主诉（chief complaint）
+        chief_complaint = self._extract_chief_complaint(raw_prompt)
+
+        # 初始化对话（使用 langchain messages）
         messages = self._build_initial_messages(chief_complaint)
         verifier_responses = []
-        human_responses_log = []
         previous_questions = []
         turn_count = 0
 
@@ -104,26 +121,36 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 turn_count = turn_idx + 1
                 is_last_turn = (turn_idx == self.max_turns - 1)
 
-                # ── Doctor 生成回复 ────────────────────────────────────────────
-                # 更新系统提示中的 current_turn
+                # ── 更新系统提示中的 current_turn ──────────────────────────────
                 messages[0] = SystemMessage(content=DOCTOR_SYSTEM_PROMPT.format(
                     max_turns=self.max_turns,
                     current_turn=turn_count,
                 ))
 
-                doctor_response = await self._call_doctor(chat_model, messages)
-                if doctor_response is None:
-                    # 超长或错误，强制结束
+                # ── Doctor 生成回复（通过 ChatModel）──────────────────────────
+                try:
+                    result = await model.ainvoke(
+                        messages,
+                        sampling_params=sampling_params,
+                    )
+                    doctor_response = result.content
+                except MaxTokenExceededError:
+                    break
+                except Exception as e:
+                    print(f"[DiagPRMAgentLoop] Doctor call error: {e}")
                     break
 
-                messages.append(AIMessage(content=doctor_response))
+                if doctor_response is None:
+                    break
+
+                # result 是 AIMessage，包含 response_metadata（prompt_ids, response_mask）
+                messages.append(result)
 
                 # ── 解析 action ────────────────────────────────────────────────
                 action = self._parse_action(doctor_response)
 
                 if action == "diagnose" or is_last_turn:
-                    # Episode 结束
-                    verifier_responses.append("<Normal>")  # 诊断轮无 verifier
+                    verifier_responses.append("<Normal>")
                     break
 
                 # ── 提取医生的问题 ──────────────────────────────────────────────
@@ -140,82 +167,118 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 verifier_responses.append(verifier_tag)
 
                 if verifier_tag in ("<Repeated>", "<Multiple>"):
-                    # 不调用患者，给出格式提示并继续
                     feedback = (
                         "You have already asked this question. Please ask a different question."
                         if verifier_tag == "<Repeated>"
                         else "Please ask only ONE question at a time."
                     )
                     messages.append(HumanMessage(content=feedback))
-                    human_responses_log.append(feedback)
                     continue
 
                 # ── Patient Simulator 回答 ──────────────────────────────────────
-                if self.use_llm_patient:
-                    patient_answer = await self._call_patient(
-                        chat_model, atomic_facts, question
-                    )
-                else:
-                    patient_answer = self._rule_based_patient(atomic_facts, question)
-
-                if patient_answer is None:
-                    patient_answer = "I'm not sure about that."
+                patient_answer = self._rule_based_patient(atomic_facts, question)
 
                 previous_questions.append(question)
-                human_responses_log.append(patient_answer)
                 messages.append(HumanMessage(content=patient_answer))
 
         except MaxTokenExceededError:
             pass
         except Exception as e:
-            print(f"[DiagPRMAgentLoop] Error: {e}")
+            print(f"[DiagPRMAgentLoop] Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # 转换为 verl AgentLoopOutput 格式
-        return self._build_output(
-            messages=messages,
-            verifier_responses=verifier_responses,
-            turn_count=turn_count,
-            ground_truth=ground_truth,
+        # ── 从最后的 AI 消息中提取 prompt_ids 和 response_mask ──────────────
+        # 找到最后一条 AI 消息
+        last_ai_msg = None
+        for msg in reversed(messages):
+            if hasattr(msg, 'type') and msg.type == 'ai':
+                last_ai_msg = msg
+                break
+
+        if last_ai_msg is None or "prompt_ids" not in last_ai_msg.response_metadata:
+            # 兜底：用 tokenizer 编码整个消息序列
+            try:
+                all_ids = self.tokenizer.apply_chat_template(
+                    [{"role": "system", "content": messages[0].content if messages else ""},
+                     {"role": "user", "content": chief_complaint}],
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+                prompt_ids = all_ids
+                response_mask = [0] * len(all_ids)
+            except Exception:
+                prompt_ids = [self.tokenizer.bos_token_id or 1]
+                response_mask = [0]
+        else:
+            prompt_ids = last_ai_msg.response_metadata["prompt_ids"]
+            response_mask = last_ai_msg.response_metadata["response_mask"]
+
+        # 将 prompt_ids 拆分为 prompt 部分和 response 部分
+        # response_mask: 1 表示 LLM 生成的 token（response），0 表示 prompt token
+        # 找到第一个 response token 的位置
+        first_response_idx = len(prompt_ids)  # 默认：无 response
+        for i, mask in enumerate(response_mask):
+            if mask == 1:
+                first_response_idx = i
+                break
+
+        pure_prompt_ids = list(prompt_ids[:first_response_idx])
+        pure_response_ids = list(prompt_ids[first_response_idx:])
+        pure_response_mask = list(response_mask[first_response_idx:])
+
+        # 确保 response_ids 非空（tokenizer.pad 无法处理空列表）
+        # 用 EOS token 作为占位符
+        _eos = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id or 0
+        if not pure_response_ids:
+            pure_response_ids = [_eos]
+            pure_response_mask = [1]
+
+        # 确保 prompt_ids 非空
+        if not pure_prompt_ids:
+            pure_prompt_ids = list(prompt_ids) if prompt_ids else [_eos]
+
+        # 截断 response_ids 不超过 max_response_length
+        max_resp_len = self.config.actor_rollout_ref.rollout.response_length
+        if len(pure_response_ids) > max_resp_len:
+            pure_response_ids = pure_response_ids[:max_resp_len]
+            pure_response_mask = pure_response_mask[:max_resp_len]
+
+        # 截断 prompt_ids 不超过 max_prompt_length（从左侧截断保留最新内容）
+        max_prompt_len = self.config.actor_rollout_ref.rollout.prompt_length
+        if len(pure_prompt_ids) > max_prompt_len:
+            pure_prompt_ids = pure_prompt_ids[-max_prompt_len:]
+
+        # 截断后重新统计实际有效的轮数（mask=1 的连续段数），
+        # 避免因 response 被截断导致 turn_count 与 parse_turns_from_response_mask 的结果不一致。
+        effective_turn_count = 0
+        _in_response = False
+        for _m in pure_response_mask:
+            if _m == 1 and not _in_response:
+                effective_turn_count += 1
+                _in_response = True
+            elif _m == 0:
+                _in_response = False
+        # 保底：至少和原 turn_count 取较小值（不能因截断多算）
+        effective_turn_count = min(effective_turn_count, turn_count)
+
+        output = AgentLoopOutput(
+            prompt_ids=pure_prompt_ids,
+            response_ids=pure_response_ids,
+            response_mask=pure_response_mask,
+            num_turns=effective_turn_count,
+            verifier_responses=verifier_responses if verifier_responses else ["<Normal>"],
+            metrics=AgentLoopMetrics(),
+            statistics={
+                "disease": disease,
+                "turn_count": effective_turn_count,
+                # _update_statistics 需要这三个键（可以为空列表）
+                "q_value_variance_list": [],
+                "mdp_value_list": [],
+                "critic_value_list": [],
+            },
         )
-
-    async def _call_doctor(
-        self,
-        chat_model: ChatModel,
-        messages: List,
-    ) -> Optional[str]:
-        """调用 Doctor Agent 模型生成回复。"""
-        try:
-            result = await chat_model.ainvoke(messages)
-            return convert_to_agent_output(result)
-        except MaxTokenExceededError:
-            raise
-        except Exception as e:
-            print(f"[Doctor call error] {e}")
-            return None
-
-    async def _call_patient(
-        self,
-        chat_model: ChatModel,
-        atomic_facts: List[str],
-        question: str,
-    ) -> Optional[str]:
-        """调用 Patient Simulator LLM 生成患者回答。"""
-        facts_text = "\n".join(f"- {f}" for f in atomic_facts) if atomic_facts else "No additional information."
-        patient_messages = [
-            SystemMessage(content=PATIENT_SYSTEM_PROMPT.format(atomic_facts=facts_text)),
-            HumanMessage(content=f"Doctor's question: {question}"),
-        ]
-        try:
-            # 患者模拟器用较低温度（更确定性）
-            result = await chat_model.ainvoke(
-                patient_messages,
-                temperature=0.3,
-                max_tokens=200,
-            )
-            return convert_to_agent_output(result)
-        except Exception as e:
-            print(f"[Patient call error] {e}")
-            return None
+        return [output]
 
     def _rule_based_patient(
         self,
@@ -323,20 +386,3 @@ class DiagPRMAgentLoop(AgentLoopBase):
             chief_complaint=chief_complaint,
         ))
         return [system_msg, user_msg]
-
-    def _build_output(
-        self,
-        messages: List,
-        verifier_responses: List[str],
-        turn_count: int,
-        ground_truth: Dict,
-    ) -> AgentLoopOutput:
-        """将对话历史转换为 verl 格式的 AgentLoopOutput。"""
-        return AgentLoopOutput(
-            messages=messages,
-            metadata={
-                "verifier_responses": verifier_responses,
-                "__num_turns__": turn_count,
-                "ground_truth": ground_truth,
-            },
-        )

@@ -15,6 +15,30 @@
 The main entry point to run the PPO algorithm
 """
 
+import os as _os
+import ctypes as _ctypes
+import site as _site
+
+# ── NCCL / RTX 5090 (sm_120 Blackwell) 兼容性 ──────────────────────────────────
+# Ray worker 不继承父进程的环境变量，必须在模块加载时直接设置。
+# PyTorch 内置 NCCL 2.26.2（cuda12.2编译），对 sm_120 Blackwell 架构支持不完整，
+# 在 FSDP broadcast 参数时触发 CUDA 非法内存访问崩溃。
+# nvidia-nccl-cu12==2.30.7 支持 sm_120，在 torch.distributed 初始化前用 ctypes 强制加载。
+_os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+_os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+_os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+
+try:
+    _site_pkgs = _site.getsitepackages()
+    for _sp in _site_pkgs:
+        _nccl_so = _os.path.join(_sp, "nvidia", "nccl", "lib", "libnccl.so.2")
+        if _os.path.exists(_nccl_so):
+            _ctypes.CDLL(_nccl_so, mode=_ctypes.RTLD_GLOBAL)
+            print(f"[fsdp_workers] Preloaded NCCL: {_nccl_so}")
+            break
+except Exception as _e:
+    print(f"[fsdp_workers] NCCL preload skipped: {_e}")
+
 import datetime
 import json
 import logging

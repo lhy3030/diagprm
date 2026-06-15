@@ -17,6 +17,35 @@
 
 set -e  # 遇到错误立即退出
 
+# ── NCCL / RTX 5090 (sm_120 Blackwell) 兼容性设置 ──────────────────────────────
+# PyTorch 内置 NCCL 2.26.2（cuda12.2编译），对 sm_120 Blackwell 支持不完整。
+# nvidia-nccl-cu12==2.30.7 已安装，通过 LD_PRELOAD 强制 torch 使用新版 NCCL。
+_NCCL_SO="$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)/nvidia/nccl/lib/libnccl.so.2"
+if [ -f "${_NCCL_SO}" ]; then
+    export LD_PRELOAD="${_NCCL_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
+    echo "[INFO] Using NCCL: ${_NCCL_SO}"
+fi
+# 禁用 NVLS（NVLink SHARP），sm_120 上有 bug
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+# 关闭 NCCL watchdog 的 async error 立即中止行为
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-0}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
+
+# ── vLLM 版本兼容性设置 ────────────────────────────────────────────────────────
+# vllm 0.9.x 的 AsyncvLLMServer 使用 V1 引擎（vllm.v1.engine）
+export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+
+# ── vLLM 缓存目录（避免 /home/ubuntu/.cache 权限问题）─────────────────────────
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/home/ubuntu/liutianshuo/.cache/vllm}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/home/ubuntu/liutianshuo/.cache}"
+mkdir -p "${VLLM_CACHE_ROOT}"
+
+# ── CUDA 库路径（vllm 需要 libcudart）──────────────────────────────────────────
+_CONDA_SITE_PKG="$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+if [ -n "${_CONDA_SITE_PKG}" ]; then
+    export LD_LIBRARY_PATH="${_CONDA_SITE_PKG}/nvidia/cu13/lib:${_CONDA_SITE_PKG}/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+fi
+
 # ── 工作目录：确保在 codes/ 下运行，使 recipe 包可被 Python 发现 ───────────────
 # 本脚本位于 codes/recipe/diagprm/run_diagprm.sh
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

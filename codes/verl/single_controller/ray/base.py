@@ -410,6 +410,26 @@ class RayWorkerGroup(WorkerGroup):
                         )
                         raise ValueError(f"Cannot override protected system env: {conflict_env_vars}")
                     env_vars.update(worker_env)
+
+                # ── NCCL / RTX 5090 (sm_120 Blackwell) 兼容性 ─────────────────
+                # Ray worker 进程不继承父进程 export 的变量；此处通过 runtime_env
+                # env_vars 注入，确保 worker 启动时 NCCL 使用正确版本和配置。
+                # nvidia-nccl-cu12>=2.27 支持 sm_120，通过 LD_PRELOAD 优先加载。
+                import site as _site_mod, os as _os_mod
+                _nccl_so = None
+                for _sp in _site_mod.getsitepackages():
+                    _candidate = _os_mod.path.join(_sp, "nvidia", "nccl", "lib", "libnccl.so.2")
+                    if _os_mod.path.exists(_candidate):
+                        _nccl_so = _candidate
+                        break
+                if _nccl_so and "LD_PRELOAD" not in env_vars:
+                    _existing_preload = _os_mod.environ.get("LD_PRELOAD", "")
+                    env_vars["LD_PRELOAD"] = f"{_nccl_so}:{_existing_preload}" if _existing_preload else _nccl_so
+                env_vars.setdefault("NCCL_NVLS_ENABLE", "0")
+                env_vars.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+                env_vars.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+                # ─────────────────────────────────────────────────────────────
+
                 import re
 
                 cia_name = type(ray_cls_with_init.cls).__name__

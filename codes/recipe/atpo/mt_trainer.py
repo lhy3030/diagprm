@@ -1216,6 +1216,16 @@ class RayPPOTrainer:
 
                     # repeat to align with repeated responses in rollout
                     if repeat_time_list:
+                        # gen_batch 在 generate 之前已经被 repeat 了 rollout.n 次 (interleave)
+                        # 导致 repeat_time_list 的长度是原始 batch 的 n 倍
+                        # 需要按每 n 个分组求和，将其压缩到与原始 batch 大小一致
+                        _n = self.config.actor_rollout_ref.rollout.n
+                        _orig_batch_size = len(batch)
+                        if len(repeat_time_list) == _orig_batch_size * _n:
+                            repeat_time_list = [
+                                sum(repeat_time_list[i * _n:(i + 1) * _n])
+                                for i in range(_orig_batch_size)
+                            ]
                         batch = batch.sample_level_repeat(repeat_times=repeat_time_list)
                     else:
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)

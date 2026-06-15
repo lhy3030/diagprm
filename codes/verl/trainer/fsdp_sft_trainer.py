@@ -75,7 +75,13 @@ from verl.utils.ulysses import (
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ImportError:
+        index_first_axis = None
+        pad_input = None
+        rearrange = None
+        unpad_input = None
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
@@ -235,7 +241,7 @@ class FSDPSFTTrainer:
                 local_model_path,
                 config=config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 trust_remote_code=trust_remote_code,
             )
 
