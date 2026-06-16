@@ -1,29 +1,38 @@
 """
 DiagPRM - Multi-turn Diagnostic Dialogue Agent Loop
 
-实现 Doctor Agent 与 Patient Simulator 的异步多轮对话。
+Implements the async multi-turn diagnostic dialogue between the Doctor Agent and Patient Simulator.
 
-对话协议（每轮）：
-  Doctor  : <think>...</think><hypothesis_state>...</hypothesis_state>
+Dialogue protocol (each turn):
+  Doctor  : <think>...</think><hypothesis name="..."><confirmed>...</confirmed></hypothesis>
              <action>continue|diagnose</action>
-             <question>...</question>  或  <diagnosis>...</diagnosis>
-  Patient : 根据原始症状列表（atomic_facts）回答医生的问题
+             <question>...</question>  or  <diagnosis>...</diagnosis>
+  Patient : Answers the doctor's question based on atomic_facts via LLM API call
 
-Doctor Agent prompt 格式（中文/英文可选）：
-  系统提示：角色描述 + 输出格式说明
-  用户消息（每轮）：患者最新回答
-  助手消息（每轮）：上一轮 Doctor 输出（含 CoT）
+Doctor Agent prompt format (state-summary mode):
+  System prompt : role description + output format (DOCTOR_SYSTEM_PROMPT, updated each turn with current_turn)
+  User message  : rebuilt each turn, no full history retained
+    - Turn 1  : DOCTOR_INITIAL_PROMPT (chief complaint, no confirmed symptoms)
+    - Turn N  : DOCTOR_TURN_PROMPT (chief complaint + current hypothesis + accumulated symptoms + last new finding)
+  No AIMessage history appended: each turn input is exactly [System, User], fixed context length
 
-Patient Simulator：
-  - 使用 mediQ 数据集中的 atomic_facts 字段
-  - 通过 LLM（vLLM）调用实现问答
-  - 备用方案：规则匹配（从 atomic_facts 中直接检索）
+State tracking (Agent Loop side):
+  current_hypothesis   : parsed from <hypothesis> in previous Doctor output
+  collected_symptoms   : accumulated confirmed symptoms from Patient answers
+  new_finding          : new symptoms added this turn (or "No new findings" for invalid questions)
+
+Patient Simulator:
+  - Uses atomic_facts from the dataset
+  - Calls an external OpenAI-compatible API (patient_api_base / patient_model config)
+  - Falls back to rule-based matching if the API call fails
 """
 
 import re
 import asyncio
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
+import aiohttp
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, convert_to_messages
 
 from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics
@@ -31,6 +40,7 @@ from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError
 from recipe.diagprm.prompts import (
     DOCTOR_SYSTEM_PROMPT,
     DOCTOR_INITIAL_PROMPT,
+    DOCTOR_TURN_PROMPT,
     PATIENT_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
 )
@@ -45,24 +55,35 @@ class DiagPRMAgentLoop(AgentLoopBase):
     DiagPRM 多轮诊断对话 Agent Loop。
     
     继承自 ATPO 的 AgentLoopBase，重写对话逻辑以支持：
-      - Doctor Agent 的结构化 CoT 格式（<hypothesis_state>, <action>）
+      - Doctor Agent 的结构化 CoT 格式（<hypothesis name="...">, <action>）
       - Patient Simulator（基于 atomic_facts 的规则 + LLM 混合问答）
       - Verifier（检测重复/多重问题）
       - 最大轮次控制
 
-    配置（来自 agent.yaml）：
-      max_turns           : 最大对话轮数（default: 10）
-      use_llm_patient     : 是否用 LLM 模拟患者（default: True）
-      patient_model       : 患者模拟器使用的模型（default: 与 doctor 相同）
-      verifier_enabled    : 是否启用问题重复检测（default: True）
+    Config (from agent.yaml):
+      max_turns           : max dialogue turns (default: 10)
+      verifier_enabled    : enable repeated-question detection (default: True)
+      patient_api_base    : base URL of the OpenAI-compatible API for the patient simulator
+                            (default: PATIENT_API_BASE env var, or "http://localhost:8001/v1")
+      patient_model       : model name for the patient simulator
+                            (default: PATIENT_MODEL env var, or "gpt-4o-mini")
+      patient_max_tokens  : max tokens for patient responses (default: 256)
     """
 
     def __init__(self, trainer_config, server_manager, tokenizer, processor, **kwargs):
-        # kwargs 包含来自 diagprm_agent.yaml 的字段（max_turns, use_llm_patient, verifier_enabled）
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
         self.max_turns = kwargs.get("max_turns", 10)
-        self.use_llm_patient = kwargs.get("use_llm_patient", True)
         self.verifier_enabled = kwargs.get("verifier_enabled", True)
+        # Patient LLM API config
+        self.patient_api_base = kwargs.get(
+            "patient_api_base",
+            os.environ.get("PATIENT_API_BASE", "http://localhost:8001/v1"),
+        )
+        self.patient_model = kwargs.get(
+            "patient_model",
+            os.environ.get("PATIENT_MODEL", "gpt-4o-mini"),
+        )
+        self.patient_max_tokens = kwargs.get("patient_max_tokens", 256)
 
     async def run(self, sampling_params: dict, **kwargs) -> list:
         """
@@ -107,31 +128,50 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
         disease = ground_truth.get("disease", "unknown")
         atomic_facts = ground_truth.get("atomic_facts", [])
-        # KG 格式的完整症状池（symptoms_pool: {symptom: weight}）
-        # 用于 patient simulator 回答医生关于任意症状的问题
-        symptoms_pool = ground_truth.get("symptoms_pool", {})
 
         # 从 prompt 中提取主诉（chief complaint）
         chief_complaint = self._extract_chief_complaint(raw_prompt)
 
-        # 初始化对话（使用 langchain messages）
-        messages = self._build_initial_messages(chief_complaint)
+        # ── 状态摘要模式：系统侧维护对话状态，每轮重建 [System, User] ──────────
+        # 不保留完整对话历史，context 长度固定为 2 条消息
         verifier_responses = []
         previous_questions = []
         turn_count = 0
+
+        # 系统侧维护的对话状态
+        collected_symptoms: List[str] = []   # 累积确认的症状（原子事实，KG 匹配用）
+        current_hypothesis: str = ""         # 上一轮 Doctor 输出的假设名
+        last_ai_msg = None                   # 保留最后一条 AIMessage（用于提取 token ids）
+        dialogue_history: List[dict] = []    # 每轮 {turn_id, doctor_response, patient_answer, fact}
+        new_finding: str = ""               # Bug3 fix: 初始化防止第 2 轮 NameError
 
         try:
             for turn_idx in range(self.max_turns):
                 turn_count = turn_idx + 1
                 is_last_turn = (turn_idx == self.max_turns - 1)
 
-                # ── 更新系统提示中的 current_turn ──────────────────────────────
-                messages[0] = SystemMessage(content=DOCTOR_SYSTEM_PROMPT.format(
+                # ── 构建本轮 [System, User] 消息 ───────────────────────────────
+                system_msg = SystemMessage(content=DOCTOR_SYSTEM_PROMPT.format(
                     max_turns=self.max_turns,
                     current_turn=turn_count,
                 ))
+                if turn_idx == 0:
+                    # 第 1 轮：只有主诉，无历史状态
+                    user_msg = HumanMessage(content=DOCTOR_INITIAL_PROMPT.format(
+                        chief_complaint=chief_complaint,
+                    ))
+                else:
+                    # 第 N 轮：注入累积状态摘要
+                    confirmed_str = ", ".join(collected_symptoms) if collected_symptoms else "None"
+                    user_msg = HumanMessage(content=DOCTOR_TURN_PROMPT.format(
+                        chief_complaint=chief_complaint,
+                        hypothesis=current_hypothesis or "Undetermined",
+                        confirmed_symptoms=confirmed_str,
+                        new_finding=new_finding,
+                    ))
+                messages = [system_msg, user_msg]
 
-                # ── Doctor 生成回复（通过 ChatModel）──────────────────────────
+                # ── Doctor 生成回复 ────────────────────────────────────────────
                 try:
                     result = await model.ainvoke(
                         messages,
@@ -147,47 +187,92 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 if doctor_response is None:
                     break
 
-                # result 是 AIMessage，包含 response_metadata（prompt_ids, response_mask）
-                messages.append(result)
+                last_ai_msg = result  # 保留用于 token 提取
 
                 # ── 解析 action ────────────────────────────────────────────────
                 action = self._parse_action(doctor_response)
 
+                # ── 更新系统侧的当前假设（从本轮输出解析）────────────────────
+                parsed_hyp, _ = self._parse_hypothesis_name(doctor_response)
+                if parsed_hyp:
+                    current_hypothesis = parsed_hyp
+
                 if action == "diagnose" or is_last_turn:
                     verifier_responses.append("<Normal>")
+                    # 记录最终轮（诊断轮无 patient 回答）
+                    dialogue_history.append({
+                        "turn_id": turn_idx,
+                        "doctor_response": doctor_response,
+                        "patient_answer": "",
+                        "patient_fact": "",
+                        "is_final": True,
+                    })
                     break
 
-                # ── 提取医生的问题 ──────────────────────────────────────────────
+                # ── 提取医生的问题 ─────────────────────────────────────────────
                 question = self._parse_question(doctor_response)
                 if question is None:
                     verifier_responses.append("<ERROR_RESPONSE>")
+                    new_finding = "Last question was malformed (no <question> tag found)."
                     break
 
-                # ── Verifier 检测（重复/多重问题）──────────────────────────────
+                # ── Verifier 检测（重复/多重问题）─────────────────────────────
                 if self.verifier_enabled:
                     verifier_tag = self._run_verifier_sync(question, previous_questions)
                 else:
                     verifier_tag = "<Normal>"
                 verifier_responses.append(verifier_tag)
 
-                if verifier_tag in ("<Repeated>", "<Multiple>"):
-                    feedback = (
-                        "You have already asked this question. Please ask a different question."
-                        if verifier_tag == "<Repeated>"
-                        else "Please ask only ONE question at a time."
-                    )
-                    messages.append(HumanMessage(content=feedback))
+                if verifier_tag == "<Repeated>":
+                    new_finding = "Last question was invalid: you already asked this question. No new information was obtained."
+                    # Bug2 fix: verifier 拦截时也需要追加问题，否则下轮仍能通过
+                    previous_questions.append(question)
+                    # 记录本轮（patient_fact=unknown 表示无效提问）
+                    dialogue_history.append({
+                        "turn_id": turn_idx,
+                        "doctor_response": doctor_response,
+                        "patient_answer": "",
+                        "patient_fact": "unknown",
+                    })
+                    continue
+                elif verifier_tag == "<Multiple>":
+                    new_finding = "Last question was invalid: you asked multiple questions at once. No new information was obtained."
+                    previous_questions.append(question)
+                    dialogue_history.append({
+                        "turn_id": turn_idx,
+                        "doctor_response": doctor_response,
+                        "patient_answer": "",
+                        "patient_fact": "unknown",
+                    })
                     continue
 
-                # ── Patient Simulator 回答 ──────────────────────────────────────
-                # 优先用 symptoms_pool（KG 格式，覆盖所有症状）
-                # 回退到 atomic_facts（MCQA 格式或 KG 初始揭示症状）
-                patient_answer = self._rule_based_patient(
-                    atomic_facts, question, symptoms_pool=symptoms_pool
-                )
+                # ── Patient Simulator 回答（LLM API）──────────────────────────
+                patient_raw = await self._llm_patient(atomic_facts, question)
 
+                # 解析 patient 回复中的 <answer> 和 <fact> 字段
+                patient_answer = self._parse_patient_answer(patient_raw)
+                patient_fact   = self._parse_patient_fact(patient_raw)
+
+                # ── Update accumulated symptoms, generate new_finding ──────────
+                # new_finding 传给 Doctor 的是自然语言 <answer>（真实性）
+                # patient_fact 传给 Reward Manager 用于 KG 匹配
+                if patient_fact and patient_fact.lower() != "unknown":
+                    if patient_fact not in collected_symptoms:
+                        collected_symptoms.append(patient_fact)
+                    new_finding = f"Patient answer: \"{patient_answer}\""
+                else:
+                    new_finding = f"Patient answer: \"{patient_answer}\" — no relevant symptom found."
+
+                # Bug3 fix: previous_questions 在 verifier 拦截时也要追加，避免死循环
                 previous_questions.append(question)
-                messages.append(HumanMessage(content=patient_answer))
+
+                # 记录本轮对话（供 Reward Manager 使用）
+                dialogue_history.append({
+                    "turn_id": turn_idx,
+                    "doctor_response": doctor_response,
+                    "patient_answer": patient_answer,
+                    "patient_fact": patient_fact,  # 原子事实或 "unknown"
+                })
 
         except MaxTokenExceededError:
             pass
@@ -197,18 +282,13 @@ class DiagPRMAgentLoop(AgentLoopBase):
             traceback.print_exc()
 
         # ── 从最后的 AI 消息中提取 prompt_ids 和 response_mask ──────────────
-        # 找到最后一条 AI 消息
-        last_ai_msg = None
-        for msg in reversed(messages):
-            if hasattr(msg, 'type') and msg.type == 'ai':
-                last_ai_msg = msg
-                break
-
+        # 状态摘要模式下 last_ai_msg 在循环中已维护，无需再遍历 messages
         if last_ai_msg is None or "prompt_ids" not in last_ai_msg.response_metadata:
-            # 兜底：用 tokenizer 编码整个消息序列
+            # 兜底：用 tokenizer 编码最后一轮的 [system, user] 消息
             try:
                 all_ids = self.tokenizer.apply_chat_template(
-                    [{"role": "system", "content": messages[0].content if messages else ""},
+                    [{"role": "system", "content": DOCTOR_SYSTEM_PROMPT.format(
+                        max_turns=self.max_turns, current_turn=turn_count)},
                      {"role": "user", "content": chief_complaint}],
                     add_generation_prompt=True,
                     tokenize=True,
@@ -280,6 +360,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
             statistics={
                 "disease": disease,
                 "turn_count": effective_turn_count,
+                # 完整对话轨迹：供 Reward Manager 直接计算 turn-level reward
+                # 每条记录: {turn_id, doctor_response, patient_answer, patient_fact, [is_final]}
+                "dialogue_history": dialogue_history,
                 # _update_statistics 需要这三个键（可以为空列表）
                 "q_value_variance_list": [],
                 "mdp_value_list": [],
@@ -288,61 +371,72 @@ class DiagPRMAgentLoop(AgentLoopBase):
         )
         return [output]
 
-    def _rule_based_patient(
+    async def _llm_patient(
         self,
         atomic_facts: List[str],
         question: str,
-        symptoms_pool: Optional[dict] = None,
     ) -> str:
         """
-        基于规则的患者回答。
-        
-        查询策略（优先级从高到低）：
-        1. symptoms_pool（KG 格式：完整症状词典 {symptom: weight}）
-           - 将问题与症状名做关键词匹配，命中则确认该症状存在
-           - 使用 symptoms_pool 可覆盖所有 KG 症状，不限于 atomic_facts 初始揭示的 1-3 条
-        2. atomic_facts（fallback：MCQA 格式或 KG 初始揭示症状）
-        
-        速度快，不需要额外 LLM 调用。
+        LLM-based patient simulator.
+
+        Calls an external OpenAI-compatible chat API with PATIENT_SYSTEM_PROMPT
+        (containing the atomic facts) and the doctor's question as the user message.
+        Falls back to a simple rule-based answer if the API call fails.
         """
+        facts_text = "\n".join(f"- {f}" for f in atomic_facts) if atomic_facts else "(no known facts)"
+        system_content = PATIENT_SYSTEM_PROMPT.format(atomic_facts=facts_text)
+
+        payload = {
+            "model": self.patient_model,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": question},
+            ],
+            "max_tokens": self.patient_max_tokens,
+            "temperature": 0.0,
+        }
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("PATIENT_API_KEY", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        url = self.patient_api_base.rstrip("/") + "/chat/completions"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["choices"][0]["message"]["content"].strip()
+                    else:
+                        text = await resp.text()
+                        print(f"[Patient API] HTTP {resp.status}: {text[:200]}")
+        except Exception as e:
+            print(f"[Patient API] call failed: {e}")
+
+        # Fallback: simple keyword match against atomic_facts
+        return self._rule_based_patient_fallback(atomic_facts, question)
+
+    def _rule_based_patient_fallback(
+        self,
+        atomic_facts: List[str],
+        question: str,
+    ) -> str:
+        """Fallback rule-based patient answer used when the LLM API is unavailable."""
         question_lower = question.lower()
-        # 提取问题中的关键词（4+ 字母，去掉常见虚词）
         keywords = set(re.findall(r'\b[a-z]{4,}\b', question_lower))
         keywords -= {"have", "does", "your", "you", "the", "any", "this", "that",
                      "please", "tell", "about", "been", "feel", "experiencing",
                      "patient", "currently", "present", "symptom", "condition"}
-
-        if not keywords:
-            return "I don't have that symptom."
-
-        # ── 策略 1：从 symptoms_pool 中匹配（KG 格式，覆盖最广）──────────────
-        if symptoms_pool:
-            matched_symptoms = []
-            for sym, weight in symptoms_pool.items():
-                sym_lower = sym.lower()
-                sym_tokens = set(re.findall(r'\b[a-z]{3,}\b', sym_lower))
-                # 问题关键词与症状词有交集则匹配
-                if keywords & sym_tokens:
-                    matched_symptoms.append((sym, weight))
-            
-            if matched_symptoms:
-                # 按权重排序，返回最相关的症状
-                matched_symptoms.sort(key=lambda x: -x[1])
-                top_syms = [s for s, _ in matched_symptoms[:2]]
-                return "Yes, I have " + " and ".join(top_syms) + "."
-        
-        # ── 策略 2：从 atomic_facts 中匹配（fallback）──────────────────────
-        if atomic_facts:
-            relevant_facts = []
+        if atomic_facts and keywords:
             for fact in atomic_facts:
-                fact_lower = fact.lower()
-                if any(kw in fact_lower for kw in keywords):
-                    relevant_facts.append(fact)
-            
-            if relevant_facts:
-                return "Yes, " + " ".join(relevant_facts[:2])
-        
-        return "No, I don't have that symptom."
+                if any(kw in fact.lower() for kw in keywords):
+                    return "Yes, " + fact
+        return "I'm not sure about that."
 
     def _run_verifier_sync(
         self,
@@ -368,6 +462,61 @@ class DiagPRMAgentLoop(AgentLoopBase):
             return "<Multiple>"
 
         return "<Normal>"
+
+    def _parse_hypothesis_name(self, doctor_response: str) -> Tuple[Optional[str], Optional[str]]:
+        """从 doctor 回复中解析 <hypothesis> 的假设名称和 action。
+
+        Returns:
+            (hypothesis_name | None, action | None)
+        """
+        hypothesis = None
+        action = None
+
+        hyp_match = re.search(
+            r'<hypothesis[^>]+name\s*=\s*["\']([^"\']+)["\']',
+            doctor_response,
+            re.IGNORECASE,
+        )
+        if hyp_match:
+            hypothesis = hyp_match.group(1).strip()
+
+        action_match = re.search(
+            r'<action>\s*(continue|switch|diagnose)\s*</action>',
+            doctor_response,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if action_match:
+            raw = action_match.group(1).strip().lower()
+            action = "continue" if raw == "switch" else raw
+
+        return hypothesis, action
+
+    def _parse_patient_answer(self, raw: str) -> str:
+        """Extract the <answer>...</answer> field from patient LLM output."""
+        match = re.search(r'<answer>\s*(.*?)\s*</answer>', raw, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Fallback: return the whole response if no tag found
+        return raw.strip()
+
+    def _parse_patient_fact(self, raw: str) -> str:
+        """Extract the <fact>...</fact> field from patient LLM output.
+
+        Returns the atomic fact string, or 'unknown' if not present / explicitly unknown.
+        """
+        match = re.search(r'<fact>\s*(.*?)\s*</fact>', raw, re.IGNORECASE | re.DOTALL)
+        if match:
+            fact = match.group(1).strip()
+            return fact if fact else "unknown"
+        return "unknown"
+
+    def _is_negative_answer(self, answer: str) -> bool:
+        """Return True if the patient's answer is a denial (no new symptom confirmed)."""
+        deny_pattern = re.compile(
+            r'^\s*(no|not|i don\'t|i\'m not|i do not|i have not|i\'m not sure|i don\'t have|i do not have)',
+            re.IGNORECASE,
+        )
+        return bool(deny_pattern.match(answer.strip()))
 
     def _parse_action(self, doctor_response: str) -> Optional[str]:
         """从 doctor 回复中解析 <action> 标签。

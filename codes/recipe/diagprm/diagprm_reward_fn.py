@@ -299,6 +299,82 @@ def update_collected_symptoms(
     return new_symptoms
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 方案A：从 dialogue_history 直接计算 episode reward（推荐路径）
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_episode_rewards_from_history(
+    dialogue_history: List[Dict],   # Agent Loop 传入的 [{turn_id, doctor_response, patient_answer, patient_fact, ...}]
+    ground_truth: str,              # ground truth 疾病名
+    kg: Dict,                       # master_kg
+    reward_params: Dict,            # 奖励系数字典
+) -> Tuple[List[float], List[float], List[Dict]]:
+    """
+    从 dialogue_history 直接计算每轮 reward，无需解析 token mask。
+
+    patient_fact 字段：
+      - 原子事实字符串（如 "chest pain"）→ 做 KG n-gram 匹配提取症状
+      - "unknown" → 无效提问，本轮 delta_kg = 0，症状集合不更新
+
+    奖励结构（每轮）：
+        r(k) = turn_coef * r_turn(k) + r_diag(k)
+        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
+    """
+    from recipe.diagprm.kg_utils import _normalize, extract_symptoms_from_text
+
+    gt_norm = _normalize(ground_truth)
+    collected_symptoms: Set[str] = set()
+
+    total_rewards = []
+    r_diag_list = []
+    details_list = []
+
+    prev_hypothesis: Optional[str] = None
+    _params = {k: v for k, v in reward_params.items() if k != "lam"}
+
+    for turn_idx, entry in enumerate(dialogue_history):
+        doctor_response = entry.get("doctor_response", "")
+        patient_fact    = entry.get("patient_fact", "unknown") or "unknown"
+        is_final        = entry.get("is_final", turn_idx == len(dialogue_history) - 1)
+
+        # 解析本轮 action 和 hypothesis
+        curr_hypothesis, action = parse_hypothesis_state(doctor_response)
+
+        # 更新症状集合：用 patient_fact 做 KG n-gram 匹配
+        prev_symptoms = set(collected_symptoms)
+        if patient_fact.lower() != "unknown" and patient_fact.strip():
+            # patient_fact 是原子事实，从中提取 KG 已知症状
+            matched = extract_symptoms_from_text(patient_fact, kg)
+            collected_symptoms.update(matched)
+            # 若没有精确 KG 命中，尝试直接规范化后加入（宽松匹配）
+            if not matched:
+                norm_fact = _normalize(patient_fact)
+                if norm_fact:
+                    collected_symptoms.add(norm_fact)
+
+        # 计算本轮 reward
+        turn_result = calculate_turn_reward(
+            model_response=doctor_response,
+            human_response=entry.get("patient_answer", ""),
+            prev_collected_symptoms=prev_symptoms,
+            curr_collected_symptoms=collected_symptoms,
+            prev_hypothesis=prev_hypothesis,
+            curr_hypothesis=curr_hypothesis,
+            action=action,
+            ground_truth_disease=gt_norm,
+            kg=kg,
+            is_final_turn=is_final,
+            **_params,
+        )
+
+        total_rewards.append(turn_result["total_reward"])
+        r_diag_list.append(turn_result["r_diag"])
+        details_list.append(turn_result["details"])
+        prev_hypothesis = curr_hypothesis
+
+    return total_rewards, r_diag_list, details_list
+
+
 def _get_context_before(target: str, text: str, window: int = 5) -> str:
     """获取 target 词之前 window 个词的文本（用于否认检测）。"""
     norm = _normalize(text)

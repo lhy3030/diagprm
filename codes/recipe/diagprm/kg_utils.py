@@ -171,8 +171,8 @@ def compute_kg_coverage_delta(
 
 def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    从模型输出中解析 <hypothesis_state> 标签，提取：
-    - primary_hypothesis: 第一个 hypothesis name（即主假设）
+    从模型输出中解析 <hypothesis> 标签，提取：
+    - primary_hypothesis: hypothesis name（即当前假设）
     - action: <action> 标签内容（continue / switch / diagnose）
 
     Returns:
@@ -181,7 +181,7 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
     primary = None
     action = None
 
-    # 解析 primary hypothesis（第一个 <hypothesis name="...">）
+    # 解析 hypothesis name（<hypothesis name="...">）
     hyp_match = re.search(
         r'<hypothesis[^>]+name\s*=\s*["\']([^"\']+)["\']',
         model_output,

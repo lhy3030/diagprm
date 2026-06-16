@@ -1,5 +1,9 @@
 - name: diagprm_interaction
   _target_: recipe.diagprm.diagprm_agent_loop.DiagPRMAgentLoop
   max_turns: 10
-  use_llm_patient: true
   verifier_enabled: true
+  # Patient simulator LLM API (OpenAI-compatible)
+  # Can also be set via environment variables: PATIENT_API_BASE, PATIENT_MODEL, PATIENT_API_KEY
+  patient_api_base: "http://localhost:8001/v1"
+  patient_model: "gpt-4o-mini"
+  patient_max_tokens: 256

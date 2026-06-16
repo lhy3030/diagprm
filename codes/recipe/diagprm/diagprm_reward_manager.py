@@ -24,6 +24,7 @@ from recipe.diagprm.diagprm_reward_fn import (
     parse_turns_from_response_mask,
     extract_human_responses,
     compute_episode_rewards,
+    compute_episode_rewards_from_history,
 )
 from recipe.diagprm.kg_utils import load_kg
 
@@ -114,20 +115,62 @@ class DiagPRMRewardManager(AbstractRewardManager):
 
             num_turn = data_item.non_tensor_batch.get("__num_turns__", None)
 
-            # 解析 turn 边界
-            turns_info = parse_turns_from_response_mask(
-                response_mask, response_ids, self.tokenizer
-            )
-            # 解析患者回复
-            human_responses = extract_human_responses(
-                response_ids, response_mask, self.tokenizer
-            )
+            # ── 优先从 statistics.dialogue_history 读取对话轨迹（方案A）──────────
+            # statistics 由 DiagPRMAgentLoop 写入，包含每轮的 doctor_response / patient_fact
+            statistics = data_item.non_tensor_batch.get("statistics", {})
+            if isinstance(statistics, dict):
+                pass
+            else:
+                try:
+                    statistics = dict(statistics) if statistics is not None else {}
+                except Exception:
+                    statistics = {}
 
-            if num_turn is not None:
-                if len(turns_info) != num_turn:
-                    print(
-                        f"[Warning] Turn count mismatch: expected {num_turn}, got {len(turns_info)}"
-                    )
+            dialogue_history = statistics.get("dialogue_history", None)
+
+            if dialogue_history:
+                # 方案A：直接从对话历史计算（推荐，无 token 解析歧义）
+                total_rewards, r_diag_list, details_list = compute_episode_rewards_from_history(
+                    dialogue_history=dialogue_history,
+                    ground_truth=ground_truth,
+                    kg=kg,
+                    reward_params=self.reward_params,
+                )
+                # 构造 turns_info 用于后续 tensor 写入（复用位置为 end_of_response）
+                # 状态摘要模式下只有一轮 response，把所有 reward 聚合到最后位置
+                turns_info = self._build_turns_info_from_history(
+                    dialogue_history, response_mask, response_ids
+                )
+            else:
+                # 方案B fallback：从 response_mask 解析（传统多轮拼接模式）
+                turns_info = parse_turns_from_response_mask(
+                    response_mask, response_ids, self.tokenizer
+                )
+                human_responses = extract_human_responses(
+                    response_ids, response_mask, self.tokenizer
+                )
+                if num_turn is not None and len(turns_info) != num_turn:
+                    print(f"[Warning] Turn count mismatch: expected {num_turn}, got {len(turns_info)}")
+
+                if not turns_info:
+                    reward_extra_info["turn_count"].append(0)
+                    reward_extra_info["process_rewards_sum"].append(0.0)
+                    reward_extra_info["outcome_reward"].append(0.0)
+                    reward_extra_info["adv_compute_info"].append({
+                        "turn_end_positions": [],
+                        "turn_process_rewards": [],
+                        "outcome_reward": 0.0,
+                        "turn_hypotheses": [],
+                    })
+                    continue
+
+                total_rewards, r_diag_list, details_list = compute_episode_rewards(
+                    turns_info=turns_info,
+                    human_responses=human_responses,
+                    ground_truth=ground_truth,
+                    kg=kg,
+                    reward_params=self.reward_params,
+                )
 
             if not turns_info:
                 reward_extra_info["turn_count"].append(0)
@@ -137,18 +180,9 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     "turn_end_positions": [],
                     "turn_process_rewards": [],
                     "outcome_reward": 0.0,
-                    "turn_hypotheses": [],   # 与正常路径保持一致
+                    "turn_hypotheses": [],
                 })
                 continue
-
-            # 计算每轮 reward：total_rewards[k] = turn_coef * r_turn(k) + r_diag(k)
-            total_rewards, r_diag_list, details_list = compute_episode_rewards(
-                turns_info=turns_info,
-                human_responses=human_responses,
-                ground_truth=ground_truth,
-                kg=kg,
-                reward_params=self.reward_params,
-            )
 
             # 将 total_reward 写入 tensor 的对应位置（end_position）
             # process_reward_tensor 存 turn_coef * r_turn（非最终轮的纯即时信号）
@@ -197,6 +231,43 @@ class DiagPRMRewardManager(AbstractRewardManager):
             }
         else:
             return outcome_reward_tensor
+
+    def _build_turns_info_from_history(
+        self,
+        dialogue_history: list,
+        response_mask,
+        response_ids,
+    ) -> list:
+        """
+        状态摘要模式下，response_ids 只含最后一轮 Doctor token。
+        构造一个单元素 turns_info，end_position 指向 response 末尾（mask=1 的最后位置）。
+        这保证 reward tensor 写入到正确位置。
+        """
+        mask_list = response_mask.tolist() if hasattr(response_mask, 'tolist') else list(response_mask)
+        # 找到最后一个 mask=1 的位置
+        last_response_pos = -1
+        for idx, m in enumerate(mask_list):
+            if m == 1:
+                last_response_pos = idx
+
+        if last_response_pos == -1:
+            return []
+
+        # 虚拟 turns_info：每个 dialogue_history 条目对应一个虚拟轮次
+        # 但 end_position 都指向同一个位置（状态摘要只有最后一轮 token）
+        turns = []
+        n = len(dialogue_history)
+        for idx, entry in enumerate(dialogue_history):
+            is_final = entry.get("is_final", idx == n - 1)
+            turns.append({
+                "turn_id": idx,
+                "start_position": last_response_pos,
+                "end_position": last_response_pos,
+                "response": entry.get("doctor_response", ""),
+                "is_final_turn": is_final,
+                "length": 1,
+            })
+        return turns
 
     def _update_detailed_metrics(
         self,
