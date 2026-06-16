@@ -207,16 +207,24 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
 def parse_final_diagnosis(model_output: str) -> Optional[str]:
     """
     解析 <diagnosis>...</diagnosis> 标签内容作为最终诊断。
+    取最后一个非占位符的诊断标签（避免 system prompt 示例干扰）。
     如果没有该标签，尝试解析 "Final Answer:" 格式（ATPO 兼容）。
     """
-    # DiagPRM 格式
-    diag_match = re.search(
+    # DiagPRM 格式 — 取所有 diagnosis 标签，从后往前找第一个非占位符
+    _PLACEHOLDER_PATTERNS = re.compile(
+        r'^\s*\[.*?\]\s*$|^disease\s*name$|^diagnosis\s*here$',
+        re.IGNORECASE,
+    )
+    all_diag = re.findall(
         r'<diagnosis>\s*(.*?)\s*</diagnosis>',
         model_output,
         re.IGNORECASE | re.DOTALL,
     )
-    if diag_match:
-        return _normalize(diag_match.group(1).strip())
+    # 从后往前找第一个非占位符诊断
+    for raw in reversed(all_diag):
+        raw = raw.strip()
+        if raw and not _PLACEHOLDER_PATTERNS.match(raw):
+            return _normalize(raw)
 
     # ATPO 兼容格式
     fa_match = re.search(

@@ -55,7 +55,14 @@ except ImportError:
     _COMPILATION_LEVEL_PIECEWISE = None
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+try:
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ImportError:
+    # vllm >= 0.9.x / 0.11.x moved SamplingMetadata to vllm.v1.sample.metadata
+    try:
+        from vllm.v1.sample.metadata import SamplingMetadata
+    except ImportError:
+        SamplingMetadata = None
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
@@ -418,9 +425,14 @@ def _monkey_patch_compute_logits(model, vocab_size: int):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata: SamplingMetadata = None,
     ) -> torch.Tensor:
-        logits = original_compute_logits(hidden_states, sampling_metadata)
+        # vllm V1 engine (>=0.9.x) calls compute_logits(hidden_states) without
+        # sampling_metadata; V0 engine passes it as second arg. Accept both.
+        if sampling_metadata is not None:
+            logits = original_compute_logits(hidden_states, sampling_metadata)
+        else:
+            logits = original_compute_logits(hidden_states)
         logits[..., vocab_size:] = float("-inf")
         return logits
 

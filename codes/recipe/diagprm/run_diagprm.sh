@@ -121,7 +121,7 @@ clip_ratio_high=0.28
 # ── 对话超参 ──────────────────────────────────────────────────────────────────
 max_turns=10           # 最大问诊轮数
 max_prompt_length=1024
-max_response_length=2048
+max_response_length=4096  # 增大：p90 约需 2500 tokens，2048 导致大量截断
 actor_lr=1e-6
 
 # ── 批量大小 ──────────────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ train_batch_size=${TRAIN_BATCH_SIZE_OVERRIDE}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE_OVERRIDE}
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_resp_per_prompt=4    # 每个 prompt 采 G=4 条轨迹（Turn-level GRPO 需要）
+n_resp_per_prompt=2    # 从4降到2：配合 max_response_length=4096，避免 actor_max_token_len 超显存
 n_resp_per_prompt_val=1
 
 # ── 性能配置 ──────────────────────────────────────────────────────────────────

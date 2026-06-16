@@ -108,6 +108,7 @@ class ExternalRayDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        **extra_kwargs,  # absorb vllm>=0.11 new kwargs like non_block
     ) -> list[Any]:
         # TODO(wuxibin): support ray compiled graph
         if isinstance(method, str):
@@ -157,6 +158,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        **extra_kwargs,  # absorb vllm>=0.11 new kwargs like non_block
     ) -> list[Any]:
         if isinstance(method, str):
             sent_method = method

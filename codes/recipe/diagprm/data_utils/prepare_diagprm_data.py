@@ -4,12 +4,23 @@ DiagPRM 数据预处理脚本
 将 mediQ / MedQA 等数据集转换为 DiagPRM 训练格式，
 输出 parquet 文件（verl RLHFDataset 标准格式）。
 
-输入格式（merged_train_dataset.jsonl）：
+支持两种输入格式：
+
+格式 1（merged_train_dataset.jsonl，ATPO MCQA 数据）：
 {
   "prompt": [{"role": "system", ...}, {"role": "user", "content": "<chief_complaint>\nProblem: ...\nOptions: {...}"}],
   "ground_truth": {"answer": "A", "answer_info": "Disease Name"},
   "extra_info": {"atomic_facts": ["1. ...", "2. ...", ...]},
   "data_source": "mcqa"
+}
+
+格式 2（kg_train_dataset.jsonl，KG 构建的诊断对话数据，推荐）：
+{
+  "prompt": [{"role": "system", ...}, {"role": "user", "content": "<initial_info>\nProblem: ...\nOptions: {...}"}],
+  "ground_truth": {"answer": "A", "answer_info": "Disease Name", "disease": "disease name",
+                   "symptoms_pool": {"symptom": weight, ...}},
+  "extra_info": {"atomic_facts": ["1. ...", ...]},
+  "data_source": "kg"
 }
 
 输出格式（diagprm_train.parquet）：
@@ -148,7 +159,11 @@ def process_record(
     kg: Optional[Dict] = None,
 ) -> Optional[Dict]:
     """
-    将单条 ATPO 格式数据转换为 DiagPRM 格式。
+    将单条数据转换为 DiagPRM 格式。
+    支持两种输入格式：
+      - ATPO MCQA 格式 (data_source=mcqa)：ground_truth.answer_info 是选项文本
+      - KG 对话格式 (data_source=kg)：ground_truth.disease 是规范化疾病名，
+        ground_truth.symptoms_pool 是症状权重字典
 
     Returns:
         转换后的记录，或 None（如果数据无效）
@@ -177,33 +192,67 @@ def process_record(
         return None
 
     # 提取 ground truth 疾病名
+    # KG 格式：ground_truth.disease 已经是规范化疾病名
+    # MCQA 格式：ground_truth.answer_info 是选项文本（可能不是疾病名）
     if isinstance(ground_truth, dict):
         answer = ground_truth.get("answer", "")
-        answer_info = ground_truth.get("answer_info", "")
-        disease_raw = answer_info if answer_info else answer
+        # 优先使用 KG 格式的 disease 字段（已规范化）
+        if ground_truth.get("disease"):
+            disease_norm = normalize_disease(ground_truth["disease"])
+            disease_raw = ground_truth.get("answer_info", ground_truth["disease"])
+        else:
+            # MCQA 格式：用 answer_info 作为疾病名
+            answer_info = ground_truth.get("answer_info", "")
+            disease_raw = answer_info if answer_info else answer
+            disease_norm = normalize_disease(disease_raw)
     else:
         answer = str(ground_truth)
         disease_raw = answer
-
-    disease_norm = normalize_disease(disease_raw)
+        disease_norm = normalize_disease(disease_raw)
 
     # 如果提供了 KG，验证疾病是否在 KG 中（可选过滤）
-    if kg is not None and disease_norm not in kg:
+    has_kg_coverage = kg is not None and disease_norm in kg
+    if kg is not None and not has_kg_coverage:
         # 疾病不在 KG 中：跳过 KG-driven reward 但仍可训练
         # 这些数据仍然有 r_hyp 和 r_diag，只是没有 delta_kg
         pass
 
+    # KG 格式：symptoms_pool 包含完整的症状权重字典
+    symptoms_pool = ground_truth.get("symptoms_pool", {})
+
+    # 构建 reward_model 字段（先获取 atomic_facts，再决定 chief_complaint 内容）
+    atomic_facts = extra_info.get("atomic_facts", [])
+
+    # KG 格式：symptoms_pool 里 top-N 症状补充到 atomic_facts（如果 atomic_facts 为空）
+    if not atomic_facts and symptoms_pool:
+        sorted_syms = sorted(symptoms_pool.items(), key=lambda x: -x[1])
+        atomic_facts = [
+            f"{i+1}. The patient has {s}."
+            for i, (s, _) in enumerate(sorted_syms[:3])
+        ]
+
+    # 增强 chief complaint：把初始揭示的症状加入主诉，让模型有真实起始信息
+    # KG 格式 chief_complaint 是通用模板，加入 atomic_facts 内容让它有实质信息
+    if atomic_facts and len(chief_complaint) < 100:
+        # chief_complaint 是通用模板（"A patient presents to the clinic with..."）
+        # 在后面加上已知的初始症状
+        facts_text = " ".join(
+            f.split(". ", 1)[1] if ". " in f else f
+            for f in atomic_facts[:2]
+        )
+        chief_complaint = chief_complaint + " The patient reports: " + facts_text
+
     # 构建 DiagPRM prompt
     diagprm_prompt = build_diagprm_prompt(chief_complaint, max_turns=max_turns)
 
-    # 构建 reward_model 字段
-    atomic_facts = extra_info.get("atomic_facts", [])
     reward_model_info = {
         "ground_truth": {
             "disease": disease_norm,         # 规范化疾病名（给 KG 查询用）
             "disease_raw": disease_raw,      # 原始字符串（logging）
             "answer": answer,                # MCQA 选项（兼容 ATPO 评估）
             "atomic_facts": atomic_facts,    # 患者 simulator 用
+            # KG 格式额外字段：完整症状池（供 patient simulator 按需查询）
+            "symptoms_pool": symptoms_pool,
         }
     }
 
@@ -214,7 +263,7 @@ def process_record(
         "agent_name": "diagprm_interaction",
         "extra_info": {
             "original_data_source": data_source,
-            "has_kg_coverage": kg is not None and disease_norm in kg,
+            "has_kg_coverage": has_kg_coverage,
             "n_atomic_facts": len(atomic_facts),
         },
     }
@@ -225,14 +274,15 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/merged_train_dataset.jsonl",
-        help="Input JSONL file path (merged_train_dataset.jsonl from ATPO)",
+        default="/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/kg_train_dataset.jsonl",
+        help="Input JSONL file path. Supports KG format (kg_train_dataset.jsonl, recommended) "
+             "or ATPO MCQA format (merged_train_dataset.jsonl)",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset",
-        help="Output directory for parquet files",
+        help="Output directory for parquet files (diagprm_train.parquet / diagprm_val.parquet)",
     )
     parser.add_argument(
         "--val_ratio",

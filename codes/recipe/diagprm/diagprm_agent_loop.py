@@ -87,8 +87,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
         )
 
         # 获取数据集字段
-        # prompt 是原始 chat messages（JSON 字符串或 list）
-        raw_prompt = kwargs.get("prompt", [])
+        # 当 data.return_raw_chat=True 时，dataset 把原始消息存在 "raw_prompt" 字段；
+        # 否则存在 "prompt" 字段（JSON 字符串形式）。两个都尝试。
+        raw_prompt = kwargs.get("raw_prompt") or kwargs.get("prompt", [])
         if isinstance(raw_prompt, str):
             try:
                 raw_prompt = json.loads(raw_prompt)
@@ -106,6 +107,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
         disease = ground_truth.get("disease", "unknown")
         atomic_facts = ground_truth.get("atomic_facts", [])
+        # KG 格式的完整症状池（symptoms_pool: {symptom: weight}）
+        # 用于 patient simulator 回答医生关于任意症状的问题
+        symptoms_pool = ground_truth.get("symptoms_pool", {})
 
         # 从 prompt 中提取主诉（chief complaint）
         chief_complaint = self._extract_chief_complaint(raw_prompt)
@@ -176,7 +180,11 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     continue
 
                 # ── Patient Simulator 回答 ──────────────────────────────────────
-                patient_answer = self._rule_based_patient(atomic_facts, question)
+                # 优先用 symptoms_pool（KG 格式，覆盖所有症状）
+                # 回退到 atomic_facts（MCQA 格式或 KG 初始揭示症状）
+                patient_answer = self._rule_based_patient(
+                    atomic_facts, question, symptoms_pool=symptoms_pool
+                )
 
                 previous_questions.append(question)
                 messages.append(HumanMessage(content=patient_answer))
@@ -284,31 +292,57 @@ class DiagPRMAgentLoop(AgentLoopBase):
         self,
         atomic_facts: List[str],
         question: str,
+        symptoms_pool: Optional[dict] = None,
     ) -> str:
         """
-        基于规则的患者回答（atomic_facts 关键词匹配）。
+        基于规则的患者回答。
+        
+        查询策略（优先级从高到低）：
+        1. symptoms_pool（KG 格式：完整症状词典 {symptom: weight}）
+           - 将问题与症状名做关键词匹配，命中则确认该症状存在
+           - 使用 symptoms_pool 可覆盖所有 KG 症状，不限于 atomic_facts 初始揭示的 1-3 条
+        2. atomic_facts（fallback：MCQA 格式或 KG 初始揭示症状）
+        
         速度快，不需要额外 LLM 调用。
         """
-        if not atomic_facts:
-            return "I don't have that symptom."
-
         question_lower = question.lower()
-        # 提取问题中的关键词
+        # 提取问题中的关键词（4+ 字母，去掉常见虚词）
         keywords = set(re.findall(r'\b[a-z]{4,}\b', question_lower))
         keywords -= {"have", "does", "your", "you", "the", "any", "this", "that",
-                     "please", "tell", "about", "been", "feel", "experiencing"}
+                     "please", "tell", "about", "been", "feel", "experiencing",
+                     "patient", "currently", "present", "symptom", "condition"}
 
-        # 在 atomic_facts 中搜索相关条目
-        relevant_facts = []
-        for fact in atomic_facts:
-            fact_lower = fact.lower()
-            if any(kw in fact_lower for kw in keywords):
-                relevant_facts.append(fact)
-
-        if relevant_facts:
-            return "Yes, " + " ".join(relevant_facts[:2])
-        else:
+        if not keywords:
             return "I don't have that symptom."
+
+        # ── 策略 1：从 symptoms_pool 中匹配（KG 格式，覆盖最广）──────────────
+        if symptoms_pool:
+            matched_symptoms = []
+            for sym, weight in symptoms_pool.items():
+                sym_lower = sym.lower()
+                sym_tokens = set(re.findall(r'\b[a-z]{3,}\b', sym_lower))
+                # 问题关键词与症状词有交集则匹配
+                if keywords & sym_tokens:
+                    matched_symptoms.append((sym, weight))
+            
+            if matched_symptoms:
+                # 按权重排序，返回最相关的症状
+                matched_symptoms.sort(key=lambda x: -x[1])
+                top_syms = [s for s, _ in matched_symptoms[:2]]
+                return "Yes, I have " + " and ".join(top_syms) + "."
+        
+        # ── 策略 2：从 atomic_facts 中匹配（fallback）──────────────────────
+        if atomic_facts:
+            relevant_facts = []
+            for fact in atomic_facts:
+                fact_lower = fact.lower()
+                if any(kw in fact_lower for kw in keywords):
+                    relevant_facts.append(fact)
+            
+            if relevant_facts:
+                return "Yes, " + " ".join(relevant_facts[:2])
+        
+        return "No, I don't have that symptom."
 
     def _run_verifier_sync(
         self,
