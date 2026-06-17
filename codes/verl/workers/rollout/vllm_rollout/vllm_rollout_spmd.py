@@ -427,11 +427,12 @@ def _monkey_patch_compute_logits(model, vocab_size: int):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata = None,
     ) -> torch.Tensor:
-        # vllm V1 engine (>=0.9.x) calls compute_logits(hidden_states) without
-        # sampling_metadata; V0 engine passes it as second arg. Accept both.
-        if sampling_metadata is not None:
+        # vllm V1 engine (>=0.9.x) calls compute_logits(hidden_states, None);
+        # always forward sampling_metadata (may be None) to the original impl.
+        try:
             logits = original_compute_logits(hidden_states, sampling_metadata)
-        else:
+        except TypeError:
+            # Fallback for models that don't accept sampling_metadata
             logits = original_compute_logits(hidden_states)
         logits[..., vocab_size:] = float("-inf")
         return logits
