@@ -126,11 +126,41 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 reward_model = {}
         ground_truth = reward_model.get("ground_truth", {})
 
-        disease = ground_truth.get("disease", "unknown")
-        atomic_facts = ground_truth.get("atomic_facts", [])
+        # New schema: disease / chief_complaint / symptoms_pool / initial_symptoms
+        # are top-level fields in the dataset row (not nested under reward_model).
+        # Fall back to the old reward_model.ground_truth layout for compatibility.
+        disease = (
+            kwargs.get("disease")
+            or ground_truth.get("disease", "unknown")
+        )
+        # initial_symptoms: KG verbatim strings revealed in the chief complaint (turn-0).
+        # Used only to build chief_complaint; NOT the Patient's full fact sheet.
+        initial_symptoms = (
+            kwargs.get("initial_symptoms")
+            or ground_truth.get("initial_symptoms", [])
+        )
 
-        # 从 prompt 中提取主诉（chief complaint）
-        chief_complaint = self._extract_chief_complaint(raw_prompt)
+        # Patient's full fact sheet = complete symptoms_pool (all KG verbatim keys).
+        # This allows the Patient to answer ANY symptom the Doctor asks about,
+        # not just the 1-3 revealed in the chief complaint.
+        # <fact> will be a verbatim copy of a symptoms_pool key -> direct KG match.
+        symptoms_pool = (
+            kwargs.get("symptoms_pool")
+            or ground_truth.get("symptoms_pool", {})
+        )
+        if symptoms_pool:
+            # Use all symptom keys (KG verbatim strings) as the Patient's fact sheet
+            atomic_facts = list(symptoms_pool.keys())
+        else:
+            # Back-compat: old format stored "atomic_facts" as sentences
+            atomic_facts_legacy = ground_truth.get("atomic_facts", [])
+            atomic_facts = initial_symptoms if initial_symptoms else atomic_facts_legacy
+
+        # chief_complaint: prefer top-level field (new schema), else parse from prompt
+        chief_complaint = (
+            kwargs.get("chief_complaint")
+            or self._extract_chief_complaint(raw_prompt)
+        )
 
         # ── 状态摘要模式：系统侧维护对话状态，每轮重建 [System, User] ──────────
         # 不保留完整对话历史，context 长度固定为 2 条消息
@@ -383,6 +413,8 @@ class DiagPRMAgentLoop(AgentLoopBase):
         (containing the atomic facts) and the doctor's question as the user message.
         Falls back to a simple rule-based answer if the API call fails.
         """
+        # atomic_facts is now a list of KG verbatim symptom strings.
+        # Format them as bullet points for the Patient Simulator prompt.
         facts_text = "\n".join(f"- {f}" for f in atomic_facts) if atomic_facts else "(no known facts)"
         system_content = PATIENT_SYSTEM_PROMPT.format(atomic_facts=facts_text)
 

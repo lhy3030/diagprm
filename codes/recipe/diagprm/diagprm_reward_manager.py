@@ -12,6 +12,7 @@ DiagPRM - Multi-Turn Reward Manager
   - adv_compute_info：传递给 compute_grpo_turn_advantage 使用
 """
 
+import json
 import torch
 import numpy as np
 from collections import defaultdict
@@ -106,12 +107,23 @@ class DiagPRMRewardManager(AbstractRewardManager):
             response_ids = data_item.batch["responses"]
             response_mask = data_item.batch["response_mask"]
 
-            # 获取 ground truth 疾病名
-            rm_info = data_item.non_tensor_batch.get("reward_model", {})
-            ground_truth = rm_info.get("ground_truth", "")
-            if isinstance(ground_truth, dict):
-                ground_truth = ground_truth.get("disease", ground_truth.get("answer", ""))
-            ground_truth = str(ground_truth)
+            # Get ground-truth disease name.
+            # New schema: top-level "disease" field (string).
+            # Old schema: reward_model.ground_truth.disease (dict).
+            ground_truth = data_item.non_tensor_batch.get("disease", None)
+            if not ground_truth:
+                rm_info = data_item.non_tensor_batch.get("reward_model", {})
+                if isinstance(rm_info, str):
+                    try:
+                        rm_info = json.loads(rm_info)
+                    except Exception:
+                        rm_info = {}
+                gt_field = rm_info.get("ground_truth", "")
+                if isinstance(gt_field, dict):
+                    ground_truth = gt_field.get("disease", gt_field.get("answer", ""))
+                else:
+                    ground_truth = str(gt_field)
+            ground_truth = str(ground_truth or "unknown")
 
             num_turn = data_item.non_tensor_batch.get("__num_turns__", None)
 

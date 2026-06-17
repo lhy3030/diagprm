@@ -340,16 +340,23 @@ def compute_episode_rewards_from_history(
         # 解析本轮 action 和 hypothesis
         curr_hypothesis, action = parse_hypothesis_state(doctor_response)
 
-        # 更新症状集合：用 patient_fact 做 KG n-gram 匹配
+        # Update symptom set from patient_fact.
+        # patient_fact is now a KG verbatim symptom key (e.g. "chest pain").
+        # 1. Try direct normalised lookup in this disease's symptom dict (fastest).
+        # 2. Fall back to full KG n-gram extraction (covers edge cases / legacy data).
         prev_symptoms = set(collected_symptoms)
         if patient_fact.lower() != "unknown" and patient_fact.strip():
-            # patient_fact 是原子事实，从中提取 KG 已知症状
-            matched = extract_symptoms_from_text(patient_fact, kg)
-            collected_symptoms.update(matched)
-            # 若没有精确 KG 命中，尝试直接规范化后加入（宽松匹配）
-            if not matched:
-                norm_fact = _normalize(patient_fact)
-                if norm_fact:
+            norm_fact = _normalize(patient_fact)
+            disease_syms = kg.get(gt_norm, {})
+            if norm_fact in disease_syms:
+                # Direct hit: verbatim KG key for this disease
+                collected_symptoms.add(norm_fact)
+            else:
+                # Fallback: n-gram match against full KG symptom pool
+                matched = extract_symptoms_from_text(patient_fact, kg)
+                collected_symptoms.update(matched)
+                # Last resort: add the normalised string as-is
+                if not matched and norm_fact:
                     collected_symptoms.add(norm_fact)
 
         # 计算本轮 reward

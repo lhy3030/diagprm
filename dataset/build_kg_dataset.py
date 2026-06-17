@@ -1,34 +1,35 @@
 """
 Build DiagPRM training & test datasets from master_kg.json.
 
-Output files (in the same directory as this script):
-  kg_train_dataset.jsonl   -- KG-derived training set  (~5000-8000 samples)
-  kg_test_dataset.jsonl    -- KG hold-out test set     (200 samples)
+Output files (in diagprm_dataset/):
+  kg_train_dataset.jsonl   -- training set  (~5000-8000 samples)
+  kg_test_dataset.jsonl    -- hold-out test set (200 samples)
 
-Each sample follows the ATPO merged_train_dataset format so it can be dropped
-directly into the existing training pipeline with no other changes.
-
-Sample schema:
+Each sample schema (minimal, RL-ready):
 {
-  "prompt": [
-    {"role": "system", "content": <SYSTEM_PROMPT>},
-    {"role": "user",   "content": "<initial_info>\nProblem: ...\nOptions: {...}"}
+  "disease":         "polycythaemia vera",          # GT for reward
+  "chief_complaint": "A patient presents ...",      # Doctor Agent turn-0 user msg
+  "symptoms_pool":   {                              # Patient Agent's full fact sheet
+    "microvascular circulation disturbances": 0.395,  # KG verbatim keys
+    "transient ischaemic attack": 0.345,              # used directly for KG coverage delta
+    ...
+  },
+  "initial_symptoms": [                            # top-1~3 KG verbatim strings
+    "microvascular circulation disturbances",       # revealed at turn-0 to Doctor
+    "transient ischaemic attack"
   ],
-  "ground_truth": {
-    "answer": "A",
-    "answer_info": "<disease_name>",
-    "disease": "<disease_name>",
-    "symptoms_pool": {<symptom: weight, ...>}   # kept for reward computation
-  },
-  "agent_name": "user_assistant_interaction",
-  "extra_info": {
-    "atomic_facts": ["1. The patient has ...", ...]   # sampled at build time;
-                                                      # can also be re-sampled
-                                                      # at training time
-  },
   "data_source": "kg",
-  "index": <int>
+  "index": 0
 }
+
+Design rationale:
+  - symptoms_pool keys are KG verbatim strings.
+  - initial_symptoms are the SAME verbatim strings (no sentence wrapping).
+  - Patient Simulator receives initial_symptoms and is instructed to copy one
+    verbatim into <fact>; the reward function matches <fact> directly against
+    symptoms_pool keys -- no mismatch possible.
+  - No MCQA wrapper (options / problem), no old system prompt.
+  - .parquet generation is handled by prepare_diagprm_data.py (placeholder role).
 """
 
 import json
@@ -38,9 +39,8 @@ import string
 from pathlib import Path
 
 # ── Symptom quality filter ────────────────────────────────────────────────────
-# These patterns identify KG entries that are NOT real patient symptoms.
 _BAD_SYMPTOM_PATTERNS = [
-    r"\b\d+[\.\-]year\b",      # "1-year survival", "10-year mortality"
+    r"\b\d+[\.\-]year\b",
     r"\bsurvival\b",
     r"\bmortality\b",
     r"\bincidence\b",
@@ -65,9 +65,7 @@ _BAD_SYMPTOM_PATTERNS = [
     r"^\d+[%\.]",
     r"^[\(\[]",
 ]
-_BAD_SYMPTOM_RE = re.compile(
-    "|".join(_BAD_SYMPTOM_PATTERNS), re.IGNORECASE
-)
+_BAD_SYMPTOM_RE = re.compile("|".join(_BAD_SYMPTOM_PATTERNS), re.IGNORECASE)
 
 
 def is_clean_symptom(sym: str) -> bool:
@@ -82,59 +80,28 @@ def is_clean_symptom(sym: str) -> bool:
     return True
 
 
-# ── paths ─────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
-KG_PATH    = SCRIPT_DIR.parent / "origin_dataset" / "master_kg.json"
+KG_PATH    = SCRIPT_DIR.parent / "diagprm_dataset" / "master_kg.json"
 TRAIN_OUT  = SCRIPT_DIR.parent / "diagprm_dataset" / "kg_train_dataset.jsonl"
 TEST_OUT   = SCRIPT_DIR.parent / "diagprm_dataset" / "kg_test_dataset.jsonl"
 
-# ── hyper-params ───────────────────────────────────────────────────────────────
+# ── Hyper-params ───────────────────────────────────────────────────────────────
 SEED                 = 42
-MIN_CLEAN_SYMPTOMS   = 5      # disease must have ≥ this many CLEAN symptoms
-COMMON_SYMPTOM_RANGE = (10, 50)  # proxy for common diseases
+MIN_CLEAN_SYMPTOMS   = 5           # disease must have >= this many clean symptoms
+COMMON_SYMPTOM_RANGE = (10, 50)    # proxy for "common / learnable" diseases
 KG_TEST_SIZE         = 200
-DISTRACTOR_COUNT     = 3
-INITIAL_REVEAL_COUNT = (1, 3)   # how many symptoms to show at turn-0
-STRONG_WEIGHT        = 0.5
+INITIAL_REVEAL_COUNT = (1, 3)      # how many symptoms to reveal at turn-0
 
-# ── system prompt (identical to ATPO's) ───────────────────────────────────────
-SYSTEM_PROMPT = (
-    "You are a professional medical assistant, possessing outstanding medical "
-    "diagnostic reasoning and analytical abilities, as well as strong clinical "
-    "inquiry and patient assessment skills.\n\n"
-    "Below, the user will provide initial patient information at the beginning "
-    "of the first round of conversation, pose a single-choice question "
-    "(Problem: question description), and give 4 options (Options: option "
-    "descriptions). Your task is to, based on the question description, the "
-    "option descriptions, the currently available patient information, and your "
-    "own knowledge, select the correct option.\n\n"
-    "Note: The initial patient information provided by the user in the first "
-    "round is incomplete. You can ask the user questions to continuously obtain "
-    "more patient information until you are confident enough to select the "
-    "correct option.\n\n"
-    "In each round of dialogue, you must first determine: Based on the question "
-    "description, the option descriptions, the currently available patient "
-    "information, and your own knowledge, do you have enough confidence to "
-    "select the correct option?\n"
-    "    - If you are not confident enough, output a specific question in the "
-    "following format:\n"
-    "      Question: [The specific question you want to ask]\n"
-    "    - If you are confident enough, output your selection in the following "
-    "format:\n"
-    "      Final Answer: [Your chosen option]\n\n"
-    "Important Notes:\n"
-    "1. In each round of conversation, you must make a clear decision — either "
-    "choose an option or ask a question. Do not be vague. When responding or "
-    "asking, you must strictly follow the corresponding format.\n"
-    "2. When choosing an option, you can only choose one from the provided "
-    "options (e.g., A, B, C, etc.), and cannot choose multiple or include any "
-    "other content.\n"
-    "3. When asking a question, you can only ask one specific question at a "
-    "time, cannot repeat questions that have already been asked, and cannot "
-    "include any other content."
-)
+# Chief-complaint templates (vague -- real info comes from initial_symptoms)
+_CC_TEMPLATES = [
+    "A patient presents to the clinic with multiple complaints.",
+    "A patient comes in with a history of several symptoms.",
+    "A patient is brought to the emergency department with various symptoms.",
+    "A patient seeks medical attention due to ongoing health issues.",
+    "A patient presents with a complex medical history and seeks evaluation.",
+]
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def load_kg(path: Path) -> dict:
     with open(path) as f:
@@ -146,96 +113,58 @@ def clean_symptoms(symptoms: dict) -> dict:
     return {s: w for s, w in symptoms.items() if is_clean_symptom(s)}
 
 
-def title_case(name: str) -> str:
-    return string.capwords(name)
-
-
-def symptom_to_fact(symptom: str, idx: int) -> str:
-    """Convert KG symptom string → readable atomic fact sentence."""
-    s = symptom.strip().lower()
-    # "pain, referred" → "referred pain"
-    if re.match(r"^[^,]+,\s+\S", s):
-        parts = [p.strip() for p in s.split(",", 1)]
-        s = f"{parts[1]} {parts[0]}"
-    return f"{idx}. The patient has {s}."
-
-
-def sample_initial_info(disease: str) -> str:
-    """Vague chief-complaint opener, deterministic per disease."""
-    templates = [
-        "A patient presents to the clinic with multiple complaints.",
-        "A patient comes in with a history of several symptoms.",
-        "A patient is brought to the emergency department with various symptoms.",
-        "A patient seeks medical attention due to ongoing health issues.",
-        "A patient presents with a complex medical history and seeks evaluation.",
-    ]
-    return random.Random(disease).choice(templates)
-
-
-def build_options(correct_disease: str, option_pool: list,
-                  rng: random.Random) -> tuple:
+def sample_initial_symptoms(clean_pool: dict, rng: random.Random) -> list:
     """
-    Build options dict {A,B,C,D}.
-    Correct disease is placed at a random letter.
-    3 distractors are sampled from option_pool.
-    """
-    letters = ["A", "B", "C", "D"]
-    correct_idx = rng.randint(0, 3)
-    candidates  = [d for d in option_pool if d != correct_disease]
-    distractors = rng.sample(candidates, DISTRACTOR_COUNT)
-    items       = distractors[:]
-    items.insert(correct_idx, correct_disease)
-    options = {l: title_case(items[i]) for i, l in enumerate(letters)}
-    return options, letters[correct_idx]
+    Select 1-3 symptoms to reveal at turn-0.
 
+    Returns a list of KG verbatim symptom strings (NOT sentences).
+    - The highest-weight symptom is always included.
+    - Extra symptoms are sampled from the top-50% pool.
 
-def sample_atomic_facts(clean_pool: dict, rng: random.Random) -> list:
-    """
-    Reveal 1-3 clean symptoms as the initial turn-0 atomic_facts.
-    Always include the highest-weight symptom so the doctor has a foothold.
+    These strings are passed as-is to the Patient Simulator and written into
+    the chief_complaint so the Doctor has an initial foothold.
     """
     sorted_syms = sorted(clean_pool.items(), key=lambda x: -x[1])
-    n_reveal    = min(rng.randint(*INITIAL_REVEAL_COUNT), len(sorted_syms))
+    n_reveal = min(rng.randint(*INITIAL_REVEAL_COUNT), len(sorted_syms))
 
-    revealed    = [sorted_syms[0][0]]          # top symptom always first
-    top_half    = [s for s, _ in sorted_syms[1:max(2, len(sorted_syms) // 2)]]
-    extra_n     = min(n_reveal - 1, len(top_half))
-    revealed   += rng.sample(top_half, extra_n)
+    revealed = [sorted_syms[0][0]]   # top-weight symptom always first
+    top_half = [s for s, _ in sorted_syms[1 : max(2, len(sorted_syms) // 2)]]
+    extra_n  = min(n_reveal - 1, len(top_half))
+    revealed += rng.sample(top_half, extra_n)
+    return revealed
 
-    return [symptom_to_fact(s, i + 1) for i, s in enumerate(revealed)]
+
+def build_chief_complaint(disease: str, initial_symptoms: list) -> str:
+    """
+    Build a natural chief-complaint sentence from the vague template +
+    the revealed initial symptoms (KG verbatim strings appended naturally).
+    """
+    template = random.Random(disease).choice(_CC_TEMPLATES)
+    if initial_symptoms:
+        syms_str = ", ".join(initial_symptoms)
+        return f"{template} The patient reports: {syms_str}."
+    return template
 
 
-def build_sample(idx: int, disease: str, clean_syms: dict,
-                 option_pool: list, rng: random.Random) -> dict:
-    options, correct_letter = build_options(disease, option_pool, rng)
-    initial_info = sample_initial_info(disease)
-    atomic_facts = sample_atomic_facts(clean_syms, rng)
-    user_content = (
-        f"{initial_info}\n"
-        f"Problem: What is the most likely diagnosis?\n"
-        f"Options: {json.dumps(options)}"
-    )
+def build_sample(
+    idx: int,
+    disease: str,
+    clean_syms: dict,
+    rng: random.Random,
+) -> dict:
+    initial_symptoms = sample_initial_symptoms(clean_syms, rng)
+    chief_complaint  = build_chief_complaint(disease, initial_symptoms)
     return {
-        "prompt": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ],
-        "ground_truth": {
-            "answer":        correct_letter,
-            "answer_info":   title_case(disease),
-            "disease":       disease,
-            "symptoms_pool": clean_syms,   # full clean pool for reward function
-        },
-        "agent_name": "user_assistant_interaction",
-        "extra_info": {
-            "atomic_facts": atomic_facts,  # partial reveal at turn 0
-        },
-        "data_source": "kg",
-        "index": idx,
+        "disease":          disease,          # GT verbatim (lower-cased KG key)
+        "chief_complaint":  chief_complaint,  # Doctor Agent turn-0 user content
+        "symptoms_pool":    clean_syms,       # {verbatim_symptom: weight} -- full fact sheet
+        "initial_symptoms": initial_symptoms, # verbatim KG strings revealed at turn-0
+        "data_source":      "kg",
+        "index":            idx,
     }
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     rng = random.Random(SEED)
@@ -256,40 +185,37 @@ def main():
         noise_filtered += len(symptoms) - n
         if n < MIN_CLEAN_SYMPTOMS:
             continue
-        kg[disease] = cleaned   # replace with clean version in-place
+        kg[disease] = cleaned
         if lo <= n <= hi:
             common_pool.append(disease)
         else:
             extended_pool.append(disease)
 
-    print(f"  Noise-filtered symptom entries: {noise_filtered}")
-    print(f"  Common-disease pool  (clean symptoms {lo}-{hi}): {len(common_pool)}")
-    print(f"  Extended pool        (clean symptoms outside range): {len(extended_pool)}")
+    print(f"  Noise-filtered symptom entries : {noise_filtered}")
+    print(f"  Common pool  (clean syms {lo}-{hi}): {len(common_pool)}")
+    print(f"  Extended pool (outside range)  : {len(extended_pool)}")
 
     # ── Step 2: select disease pool ───────────────────────────────────────────
-    TARGET = 8000 + KG_TEST_SIZE
+    TARGET       = 8000 + KG_TEST_SIZE
     use_common   = common_pool[:]
     need_extra   = max(0, TARGET - len(use_common))
     use_extended = rng.sample(extended_pool, min(need_extra, len(extended_pool)))
     all_selected = use_common + use_extended
     rng.shuffle(all_selected)
-    print(f"  Total selected diseases: {len(all_selected)}")
+    print(f"  Total selected diseases        : {len(all_selected)}")
 
     # ── Step 3: train / test split ────────────────────────────────────────────
-    # Hold out KG_TEST_SIZE diseases from common_pool
     test_diseases  = rng.sample(common_pool, min(KG_TEST_SIZE, len(common_pool)))
     test_set       = set(test_diseases)
     train_diseases = [d for d in all_selected if d not in test_set]
-    print(f"  Training diseases: {len(train_diseases)}")
-    print(f"  Test diseases:     {len(test_diseases)}")
-
-    option_pool = all_selected   # draw distractors from full selected pool
+    print(f"  Training diseases : {len(train_diseases)}")
+    print(f"  Test diseases     : {len(test_diseases)}")
 
     # ── Step 4: build training samples ───────────────────────────────────────
     print("Building training samples ...")
     train_samples = []
     for i, disease in enumerate(train_diseases):
-        sample = build_sample(i, disease, kg[disease], option_pool, rng)
+        sample = build_sample(i, disease, kg[disease], rng)
         train_samples.append(sample)
 
     with open(TRAIN_OUT, "w") as f:
@@ -297,11 +223,11 @@ def main():
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
     print(f"  Written {len(train_samples)} samples → {TRAIN_OUT}")
 
-    # ── Step 5: build KG hold-out test samples ────────────────────────────────
+    # ── Step 5: build test samples ────────────────────────────────────────────
     print("Building KG test samples ...")
     test_samples = []
     for i, disease in enumerate(test_diseases):
-        sample = build_sample(i, disease, kg[disease], option_pool, rng)
+        sample = build_sample(i, disease, kg[disease], rng)
         sample["data_source"] = "kg_test"
         test_samples.append(sample)
 
@@ -313,28 +239,27 @@ def main():
     # ── Step 6: sanity check ─────────────────────────────────────────────────
     print("\n=== Sanity Check (first training sample) ===")
     s = train_samples[0]
-    print(f"  disease      : {s['ground_truth']['disease']}")
-    print(f"  correct_opt  : {s['ground_truth']['answer']} = "
-          f"{s['ground_truth']['answer_info']}")
-    opts = json.loads(s['prompt'][1]['content'].split('Options: ', 1)[1])
-    print(f"  options      : {opts}")
-    print(f"  atomic_facts : {s['extra_info']['atomic_facts']}")
-    n_pool = len(s['ground_truth']['symptoms_pool'])
-    print(f"  symptoms_pool: {n_pool} clean symptoms")
+    print(f"  disease           : {s['disease']}")
+    print(f"  chief_complaint   : {s['chief_complaint']}")
+    print(f"  initial_symptoms  : {s['initial_symptoms']}")
+    print(f"  symptoms_pool size: {len(s['symptoms_pool'])}")
+    # Verify initial_symptoms are all keys in symptoms_pool
+    for sym in s["initial_symptoms"]:
+        assert sym in s["symptoms_pool"], f"initial_symptom '{sym}' not in symptoms_pool!"
+    print("  initial_symptoms all in symptoms_pool: OK")
 
-    # Verify no overlap
-    train_set_diseases = {s['ground_truth']['disease'] for s in train_samples}
-    test_set_diseases  = {s['ground_truth']['disease'] for s in test_samples}
+    # Verify no train/test overlap
+    train_set_diseases = {s["disease"] for s in train_samples}
+    test_set_diseases  = {s["disease"] for s in test_samples}
     overlap = train_set_diseases & test_set_diseases
-    print(f"\n  Train/test overlap: {len(overlap)} diseases (must be 0)")
-    assert len(overlap) == 0, f"Overlap: {overlap}"
+    print(f"\n  Train/test disease overlap: {len(overlap)} (must be 0)")
+    assert len(overlap) == 0, f"Overlap detected: {overlap}"
 
-    # Show a few clean symptoms from a well-known disease
-    for demo in ["type 2 diabetes mellitus", "hypertension", "pneumonia",
-                 "depression"]:
+    # Show clean top-5 for a well-known disease
+    for demo in ["type 2 diabetes mellitus", "hypertension", "pneumonia", "depression"]:
         if demo in kg:
             top5 = sorted(kg[demo].items(), key=lambda x: -x[1])[:5]
-            print(f"\n  {demo} clean top-5: {[s for s, _ in top5]}")
+            print(f"\n  {demo} clean top-5: {[sym for sym, _ in top5]}")
 
     print("\nDone.")
 
