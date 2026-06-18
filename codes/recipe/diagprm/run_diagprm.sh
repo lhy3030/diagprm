@@ -149,7 +149,7 @@ train_batch_size=${TRAIN_BATCH_SIZE_OVERRIDE}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE_OVERRIDE}
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_resp_per_prompt=${N_RESP_PER_PROMPT_OVERRIDE:-4}  # GRPO group size G；可设为 8 做主实验大组对比
+n_resp_per_prompt=${N_RESP_PER_PROMPT_OVERRIDE:-8}  # GRPO group size G；可设为 8 做主实验大组对比
 n_resp_per_prompt_val=1
 
 # ── 性能配置 ──────────────────────────────────────────────────────────────────
