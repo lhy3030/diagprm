@@ -4,20 +4,16 @@ DiagPRM - Multi-turn Diagnostic Dialogue Agent Loop
 Implements the async multi-turn diagnostic dialogue between the Doctor Agent and Patient Simulator.
 
 Dialogue protocol (each turn):
-  Doctor  : <think>...</think><hypothesis name="..."><confirmed>...</confirmed></hypothesis>
-             <action>continue|diagnose</action>
-             <question>...</question>  or  <diagnosis>...</diagnosis>
-  Patient : Answers the doctor's question based on atomic_facts via LLM API call
+  Doctor  : JSON block with keys: thought, hypothesis, confirmed, action, question/diagnosis
+  Patient : JSON block with keys: answer, fact
 
-Doctor Agent prompt format (state-summary mode):
+Doctor Agent prompt format (full-history multi-turn mode):
   System prompt : role description + output format (DOCTOR_SYSTEM_PROMPT, updated each turn with current_turn)
-  User message  : rebuilt each turn, no full history retained
-    - Turn 1  : DOCTOR_INITIAL_PROMPT (chief complaint, no confirmed symptoms)
-    - Turn N  : DOCTOR_TURN_PROMPT (chief complaint + current hypothesis + accumulated symptoms + last new finding)
-  No AIMessage history appended: each turn input is exactly [System, User], fixed context length
+  History       : previous patient messages, Doctor JSON responses, KG feedback, and patient answers
+  Next turn     : current prompt is the previous prompt + previous Doctor response + previous patient answer
 
 State tracking (Agent Loop side):
-  current_hypothesis   : parsed from <hypothesis> in previous Doctor output
+  current_hypothesis   : parsed from JSON in previous Doctor output
   collected_symptoms   : accumulated confirmed symptoms from Patient answers
   new_finding          : new symptoms added this turn (or "No new findings" for invalid questions)
 
@@ -33,16 +29,21 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, convert_to_messages
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics
 from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError
+from recipe.diagprm.kg_utils import (
+    load_kg,
+    lookup_disease_name,
+    query_diseases_by_symptom,
+    query_symptoms_by_disease,
+)
 from recipe.diagprm.prompts import (
     DOCTOR_SYSTEM_PROMPT,
-    DOCTOR_INITIAL_PROMPT,
-    DOCTOR_TURN_PROMPT,
+    DOCTOR_SYSTEM_PROMPT_NO_KG,
     PATIENT_SYSTEM_PROMPT,
-    VERIFIER_SYSTEM_PROMPT,
+    PATIENT_OPENING_PROMPT,
 )
 
 
@@ -68,6 +69,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
       patient_model       : model name for the patient simulator
                             (default: PATIENT_MODEL env var, or "gpt-4o-mini")
       patient_max_tokens  : max tokens for patient responses (default: 256)
+      kg_tool_enabled     : whether Doctor can observe KG query feedback (default: False)
+      kg_path             : path to master_kg.json (for KG query tool; falls back to
+                            reward_model.kg_path in trainer config if not provided)
     """
 
     def __init__(self, trainer_config, server_manager, tokenizer, processor, **kwargs):
@@ -84,6 +88,29 @@ class DiagPRMAgentLoop(AgentLoopBase):
             os.environ.get("PATIENT_MODEL", "gpt-4o-mini"),
         )
         self.patient_max_tokens = kwargs.get("patient_max_tokens", 256)
+        self.kg_tool_enabled = bool(kwargs.get("kg_tool_enabled", False))
+        self.doctor_system_prompt = (
+            DOCTOR_SYSTEM_PROMPT if self.kg_tool_enabled else DOCTOR_SYSTEM_PROMPT_NO_KG
+        )
+
+        # KG tool: 加载知识图谱供医生诊断时查询 verbatim 疾病名
+        kg_path = (
+            kwargs.get("kg_path")
+            or os.environ.get("KG_PATH", "")
+            or getattr(getattr(self.config, "reward_model", None), "kg_path", "")
+        )
+        if self.kg_tool_enabled and kg_path:
+            try:
+                self._kg = load_kg(kg_path)
+                print(f"[DiagPRMAgentLoop] KG loaded: {len(self._kg):,} diseases")
+            except Exception as e:
+                print(f"[DiagPRMAgentLoop] WARNING: failed to load KG from {kg_path}: {e}")
+                self._kg = None
+        elif self.kg_tool_enabled:
+            print("[DiagPRMAgentLoop] WARNING: kg_path not set; KG query tool disabled.")
+            self._kg = None
+        else:
+            self._kg = None
 
     async def run(self, sampling_params: dict, **kwargs) -> list:
         """
@@ -162,46 +189,49 @@ class DiagPRMAgentLoop(AgentLoopBase):
             or self._extract_chief_complaint(raw_prompt)
         )
 
-        # ── 状态摘要模式：系统侧维护对话状态，每轮重建 [System, User] ──────────
-        # 不保留完整对话历史，context 长度固定为 2 条消息
+        # ── 标准 multi-turn 模式：维护完整对话历史列表 ──────────────────────
         verifier_responses = []
         previous_questions = []
         turn_count = 0
 
-        # 系统侧维护的对话状态
-        collected_symptoms: List[str] = []   # 累积确认的症状（原子事实，KG 匹配用）
+        # 系统侧维护（仅用于 reward 计算，不影响 doctor prompt）
+        collected_symptoms: List[str] = []   # 累积确认的症状（KG 匹配用）
         current_hypothesis: str = ""         # 上一轮 Doctor 输出的假设名
         last_ai_msg = None                   # 保留最后一条 AIMessage（用于提取 token ids）
         dialogue_history: List[dict] = []    # 每轮 {turn_id, doctor_response, patient_answer, fact}
-        new_finding: str = ""               # Bug3 fix: 初始化防止第 2 轮 NameError
+
+        # ── 第 0 步：Patient Agent 生成自然语言主诉开场白 ────────────────────
+        patient_opening = await self._llm_patient_opening(initial_symptoms)
+
+        # ── 初始化完整对话历史 ───────────────────────────────────────────────
+        # messages 列表结构：
+        #   [0] SystemMessage (system prompt，每轮更新 current_turn)
+        #   [1] HumanMessage  (patient 主诉)
+        #   [2] AIMessage     (doctor 第1轮回复)
+        #   [3] HumanMessage  (patient 第1轮回答)
+        #   [4] AIMessage     (doctor 第2轮回复)
+        #   ...
+        messages: List = [
+            SystemMessage(content=self.doctor_system_prompt.format(
+                max_turns=self.max_turns,
+                current_turn=1,
+            )),
+            HumanMessage(content=patient_opening),
+        ]
 
         try:
             for turn_idx in range(self.max_turns):
                 turn_count = turn_idx + 1
                 is_last_turn = (turn_idx == self.max_turns - 1)
 
-                # ── 构建本轮 [System, User] 消息 ───────────────────────────────
-                system_msg = SystemMessage(content=DOCTOR_SYSTEM_PROMPT.format(
+                # ── 每轮更新 system prompt 中的 current_turn ─────────────────
+                # 替换 messages[0]，使模型始终知道当前是第几轮
+                messages[0] = SystemMessage(content=self.doctor_system_prompt.format(
                     max_turns=self.max_turns,
                     current_turn=turn_count,
                 ))
-                if turn_idx == 0:
-                    # 第 1 轮：只有主诉，无历史状态
-                    user_msg = HumanMessage(content=DOCTOR_INITIAL_PROMPT.format(
-                        chief_complaint=chief_complaint,
-                    ))
-                else:
-                    # 第 N 轮：注入累积状态摘要
-                    confirmed_str = ", ".join(collected_symptoms) if collected_symptoms else "None"
-                    user_msg = HumanMessage(content=DOCTOR_TURN_PROMPT.format(
-                        chief_complaint=chief_complaint,
-                        hypothesis=current_hypothesis or "Undetermined",
-                        confirmed_symptoms=confirmed_str,
-                        new_finding=new_finding,
-                    ))
-                messages = [system_msg, user_msg]
 
-                # ── Doctor 生成回复 ────────────────────────────────────────────
+                # ── Doctor 生成回复（传入完整对话历史）────────────────────────
                 try:
                     result = await model.ainvoke(
                         messages,
@@ -222,10 +252,79 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 # ── 解析 action ────────────────────────────────────────────────
                 action = self._parse_action(doctor_response)
 
-                # ── 更新系统侧的当前假设（从本轮输出解析）────────────────────
+                # ── 更新系统侧的当前假设（从本轮输出解析，供 reward 计算用）──
                 parsed_hyp, _ = self._parse_hypothesis_name(doctor_response)
                 if parsed_hyp:
                     current_hypothesis = parsed_hyp
+
+                # ── 将 doctor 回复追加到对话历史 ─────────────────────────────
+                # 必须保留 ChatModel 写入的 response_metadata，后续轮次会基于
+                # 其中的 cumulative prompt_ids / response_mask 继续拼接。
+                messages.append(result)
+
+                # ── KG 工具处理（三种查询，可同时出现）──────────────────────
+                if self._kg is not None:
+                    kg_feedback_parts = []
+                    parsed_json = self._parse_doctor_json(doctor_response)
+
+                    # 1. query_kg: 疾病名 → KG 标准名（诊断时使用）
+                    kg_query = parsed_json.get("query_kg", "").strip() if isinstance(parsed_json.get("query_kg"), str) else ""
+                    if kg_query:
+                        verbatim_name = lookup_disease_name(kg_query, self._kg)
+                        if verbatim_name:
+                            kg_feedback_parts.append(
+                                f"[KG:disease_name] \"{kg_query}\" → official name: \"{verbatim_name}\". "
+                                f"Use this exact string in your \"diagnosis\" field."
+                            )
+                        else:
+                            kg_feedback_parts.append(
+                                f"[KG:disease_name] \"{kg_query}\" → not found in KG."
+                            )
+                        print(f"[DiagPRMAgentLoop] KG query_kg: '{kg_query}' → '{verbatim_name}'")
+
+                    # 2. query_kg_symptom: 症状 → 含该症状的疾病候选列表（初始假设形成）
+                    kg_sym_queries = parsed_json.get("query_kg_symptom", [])
+                    if isinstance(kg_sym_queries, str):
+                        kg_sym_queries = [kg_sym_queries]
+                    for sym_q in kg_sym_queries:
+                        if not isinstance(sym_q, str) or not sym_q.strip():
+                            continue
+                        sym_q = sym_q.strip()
+                        results = query_diseases_by_symptom(sym_q, self._kg, top_k=5)
+                        if results:
+                            diseases_str = ", ".join(f"\"{d}\" (w={w:.2f})" for d, w in results)
+                            kg_feedback_parts.append(
+                                f"[KG:symptom→diseases] symptom \"{sym_q}\" appears in: {diseases_str}."
+                            )
+                        else:
+                            kg_feedback_parts.append(
+                                f"[KG:symptom→diseases] symptom \"{sym_q}\" → no matching diseases found."
+                            )
+                        print(f"[DiagPRMAgentLoop] KG query_symptom: '{sym_q}' → {[d for d,_ in results]}")
+
+                    # 3. query_kg_disease_symptoms: 疾病名 → 该病的 KG 症状列表（定向问诊）
+                    kg_dis_queries = parsed_json.get("query_kg_disease_symptoms", [])
+                    if isinstance(kg_dis_queries, str):
+                        kg_dis_queries = [kg_dis_queries]
+                    for dis_q in kg_dis_queries:
+                        if not isinstance(dis_q, str) or not dis_q.strip():
+                            continue
+                        dis_q = dis_q.strip()
+                        results = query_symptoms_by_disease(dis_q, self._kg, top_k=10)
+                        if results:
+                            syms_str = ", ".join(f"\"{s}\" (w={w:.2f})" for s, w in results)
+                            kg_feedback_parts.append(
+                                f"[KG:disease→symptoms] disease \"{dis_q}\" has symptoms: {syms_str}. "
+                                f"Ask about unconfirmed symptoms to gather evidence."
+                            )
+                        else:
+                            kg_feedback_parts.append(
+                                f"[KG:disease→symptoms] disease \"{dis_q}\" → not found in KG."
+                            )
+                        print(f"[DiagPRMAgentLoop] KG query_disease_syms: '{dis_q}' → {[s for s,_ in results]}")
+
+                    if kg_feedback_parts:
+                        messages.append(HumanMessage(content="\n".join(kg_feedback_parts)))
 
                 if action == "diagnose" or is_last_turn:
                     verifier_responses.append("<Normal>")
@@ -243,7 +342,10 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 question = self._parse_question(doctor_response)
                 if question is None:
                     verifier_responses.append("<ERROR_RESPONSE>")
-                    new_finding = "Last question was malformed (no <question> tag found)."
+                    # 用系统提示告知医生格式有误，追加到历史
+                    messages.append(HumanMessage(
+                        content="[System] Your last response had no valid question. Please ask exactly one focused question."
+                    ))
                     break
 
                 # ── Verifier 检测（重复/多重问题）─────────────────────────────
@@ -254,10 +356,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 verifier_responses.append(verifier_tag)
 
                 if verifier_tag == "<Repeated>":
-                    new_finding = "Last question was invalid: you already asked this question. No new information was obtained."
-                    # Bug2 fix: verifier 拦截时也需要追加问题，否则下轮仍能通过
+                    feedback = "You already asked this question. Please ask a different, more targeted question."
+                    messages.append(HumanMessage(content=f"[System] {feedback}"))
                     previous_questions.append(question)
-                    # 记录本轮（patient_fact=unknown 表示无效提问）
                     dialogue_history.append({
                         "turn_id": turn_idx,
                         "doctor_response": doctor_response,
@@ -266,7 +367,8 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     })
                     continue
                 elif verifier_tag == "<Multiple>":
-                    new_finding = "Last question was invalid: you asked multiple questions at once. No new information was obtained."
+                    feedback = "You asked multiple questions at once. Please ask exactly one focused question."
+                    messages.append(HumanMessage(content=f"[System] {feedback}"))
                     previous_questions.append(question)
                     dialogue_history.append({
                         "turn_id": turn_idx,
@@ -279,21 +381,18 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 # ── Patient Simulator 回答（LLM API）──────────────────────────
                 patient_raw = await self._llm_patient(atomic_facts, question)
 
-                # 解析 patient 回复中的 <answer> 和 <fact> 字段
+                # 解析 patient 回复中的 answer 和 fact 字段
                 patient_answer = self._parse_patient_answer(patient_raw)
                 patient_fact   = self._parse_patient_fact(patient_raw)
 
-                # ── Update accumulated symptoms, generate new_finding ──────────
-                # new_finding 传给 Doctor 的是自然语言 <answer>（真实性）
-                # patient_fact 传给 Reward Manager 用于 KG 匹配
+                # ── 将 patient 回答追加到对话历史 ────────────────────────────
+                messages.append(HumanMessage(content=patient_answer))
+
+                # ── 更新累积症状（供 reward 计算用）──────────────────────────
                 if patient_fact and patient_fact.lower() != "unknown":
                     if patient_fact not in collected_symptoms:
                         collected_symptoms.append(patient_fact)
-                    new_finding = f"Patient answer: \"{patient_answer}\""
-                else:
-                    new_finding = f"Patient answer: \"{patient_answer}\" — no relevant symptom found."
 
-                # Bug3 fix: previous_questions 在 verifier 拦截时也要追加，避免死循环
                 previous_questions.append(question)
 
                 # 记录本轮对话（供 Reward Manager 使用）
@@ -311,13 +410,18 @@ class DiagPRMAgentLoop(AgentLoopBase):
             import traceback
             traceback.print_exc()
 
-        # ── 从最后的 AI 消息中提取 prompt_ids 和 response_mask ──────────────
-        # 状态摘要模式下 last_ai_msg 在循环中已维护，无需再遍历 messages
+        # ── 从最后的 AI 消息中提取完整 multi-turn token 序列 ────────────────
+        # ChatModel 会在每轮 AIMessage.response_metadata 中累积：
+        #   prompt_ids     = 初始 prompt + 所有 assistant/human/KG feedback tokens
+        #   response_mask  = 初始 prompt 之后各 token 的 mask（assistant=1, human/KG=0）
+        # 因此按照 ATPO 传统 multi-turn 格式切分：
+        #   response_ids = prompt_ids[-len(response_mask):]
+        #   prompt_ids   = prompt_ids[:-len(response_mask)]
         if last_ai_msg is None or "prompt_ids" not in last_ai_msg.response_metadata:
             # 兜底：用 tokenizer 编码最后一轮的 [system, user] 消息
             try:
                 all_ids = self.tokenizer.apply_chat_template(
-                    [{"role": "system", "content": DOCTOR_SYSTEM_PROMPT.format(
+                    [{"role": "system", "content": self.doctor_system_prompt.format(
                         max_turns=self.max_turns, current_turn=turn_count)},
                      {"role": "user", "content": chief_complaint}],
                     add_generation_prompt=True,
@@ -332,18 +436,17 @@ class DiagPRMAgentLoop(AgentLoopBase):
             prompt_ids = last_ai_msg.response_metadata["prompt_ids"]
             response_mask = last_ai_msg.response_metadata["response_mask"]
 
-        # 将 prompt_ids 拆分为 prompt 部分和 response 部分
-        # response_mask: 1 表示 LLM 生成的 token（response），0 表示 prompt token
-        # 找到第一个 response token 的位置
-        first_response_idx = len(prompt_ids)  # 默认：无 response
-        for i, mask in enumerate(response_mask):
-            if mask == 1:
-                first_response_idx = i
-                break
+        prompt_ids = list(prompt_ids)
+        response_mask = list(response_mask)
 
-        pure_prompt_ids = list(prompt_ids[:first_response_idx])
-        pure_response_ids = list(prompt_ids[first_response_idx:])
-        pure_response_mask = list(response_mask[first_response_idx:])
+        if response_mask:
+            pure_response_ids = prompt_ids[-len(response_mask):]
+            pure_prompt_ids = prompt_ids[:-len(response_mask)]
+            pure_response_mask = response_mask
+        else:
+            pure_prompt_ids = prompt_ids
+            pure_response_ids = []
+            pure_response_mask = []
 
         # 确保 response_ids 非空（tokenizer.pad 无法处理空列表）
         # 用 EOS token 作为占位符
@@ -470,6 +573,64 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     return "Yes, " + fact
         return "I'm not sure about that."
 
+    async def _llm_patient_opening(
+        self,
+        initial_symptoms: List[str],
+    ) -> str:
+        """
+        让 Patient LLM 根据 initial_symptoms 生成自然语言开场白（仅主诉）。
+
+        只告知患者"这是你现在需要描述的症状"，严格禁止透露诊断。
+        失败时回退到简单拼接：
+          "Hello doctor, I've been experiencing {sym1}, {sym2}."
+
+        Returns:
+            患者的自然语言开场白字符串（纯文本，无 JSON）。
+        """
+        if not initial_symptoms:
+            return "Hello doctor, I haven't been feeling well lately and would like to get checked out."
+
+        syms_str = "\n".join(f"- {s}" for s in initial_symptoms)
+        system_content = PATIENT_OPENING_PROMPT.format(initial_symptoms=syms_str)
+
+        payload = {
+            "model": self.patient_model,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "Please introduce yourself to the doctor now."},
+            ],
+            "max_tokens": 128,
+            "temperature": 0.7,
+        }
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("PATIENT_API_KEY", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        url = self.patient_api_base.rstrip("/") + "/chat/completions"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        opening = data["choices"][0]["message"]["content"].strip()
+                        if opening:
+                            return opening
+                    else:
+                        text = await resp.text()
+                        print(f"[Patient Opening API] HTTP {resp.status}: {text[:200]}")
+        except Exception as e:
+            print(f"[Patient Opening API] call failed: {e}")
+
+        # Fallback: 直接拼接
+        syms_natural = ", ".join(initial_symptoms)
+        return f"Hello doctor, I've been experiencing {syms_natural}. I'd like to get checked out."
+
     def _run_verifier_sync(
         self,
         question: str,
@@ -495,47 +656,113 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
         return "<Normal>"
 
+    def _parse_doctor_json(self, doctor_response: str) -> Dict:
+        """从 doctor 回复中解析 JSON 块。
+
+        支持三种格式：
+          1. ```json ... ``` 代码块
+          2. 裸 JSON 对象 {...}
+          3. 模型内部 <think> 后的 JSON
+
+        Returns:
+            解析后的 dict，失败时返回 {}
+        """
+        # 1. 尝试提取 ```json ... ``` 代码块
+        code_block = re.search(r'```json\s*([\s\S]*?)```', doctor_response, re.IGNORECASE)
+        if code_block:
+            try:
+                result = json.loads(code_block.group(1).strip())
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        # 2. 去掉 <think>...</think> 再找 {...}
+        stripped = re.sub(r'<think>[\s\S]*?</think>', '', doctor_response, flags=re.IGNORECASE)
+        brace_match = re.search(r'(\{[\s\S]*\})', stripped)
+        if brace_match:
+            try:
+                result = json.loads(brace_match.group(1).strip())
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        # 3. 对整个 response 尝试（兜底）
+        brace_match2 = re.search(r'(\{[\s\S]*\})', doctor_response)
+        if brace_match2:
+            try:
+                result = json.loads(brace_match2.group(1).strip())
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        return {}
+
     def _parse_hypothesis_name(self, doctor_response: str) -> Tuple[Optional[str], Optional[str]]:
-        """从 doctor 回复中解析 <hypothesis> 的假设名称和 action。
+        """从 doctor 回复中解析假设名称和 action（JSON 格式）。
 
         Returns:
             (hypothesis_name | None, action | None)
         """
-        hypothesis = None
-        action = None
-
-        hyp_match = re.search(
-            r'<hypothesis[^>]+name\s*=\s*["\']([^"\']+)["\']',
-            doctor_response,
-            re.IGNORECASE,
-        )
-        if hyp_match:
-            hypothesis = hyp_match.group(1).strip()
-
-        action_match = re.search(
-            r'<action>\s*(continue|switch|diagnose)\s*</action>',
-            doctor_response,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if action_match:
-            raw = action_match.group(1).strip().lower()
-            action = "continue" if raw == "switch" else raw
-
+        parsed = self._parse_doctor_json(doctor_response)
+        hypothesis = parsed.get("hypothesis") or None
+        if hypothesis:
+            hypothesis = str(hypothesis).strip()
+        raw_action = parsed.get("action", "").strip().lower()
+        action = "continue" if raw_action == "switch" else (raw_action if raw_action in ("continue", "diagnose") else None)
         return hypothesis, action
 
+    def _parse_patient_json(self, raw: str) -> Dict:
+        """从 patient 回复中解析 JSON 块。
+
+        Returns:
+            解析后的 dict，失败时返回 {}
+        """
+        # 1. 尝试提取 ```json ... ``` 代码块
+        code_block = re.search(r'```json\s*([\s\S]*?)```', raw, re.IGNORECASE)
+        if code_block:
+            try:
+                result = json.loads(code_block.group(1).strip())
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        # 2. 找 {...} 对象
+        brace_match = re.search(r'(\{[\s\S]*\})', raw)
+        if brace_match:
+            try:
+                result = json.loads(brace_match.group(1).strip())
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        return {}
+
     def _parse_patient_answer(self, raw: str) -> str:
-        """Extract the <answer>...</answer> field from patient LLM output."""
+        """Extract the answer field from patient LLM output (JSON format)."""
+        parsed = self._parse_patient_json(raw)
+        if parsed.get("answer"):
+            return str(parsed["answer"]).strip()
+        # Fallback: legacy XML tag
         match = re.search(r'<answer>\s*(.*?)\s*</answer>', raw, re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
-        # Fallback: return the whole response if no tag found
         return raw.strip()
 
     def _parse_patient_fact(self, raw: str) -> str:
-        """Extract the <fact>...</fact> field from patient LLM output.
+        """Extract the fact field from patient LLM output (JSON format).
 
         Returns the atomic fact string, or 'unknown' if not present / explicitly unknown.
         """
+        parsed = self._parse_patient_json(raw)
+        if "fact" in parsed:
+            fact = str(parsed["fact"]).strip()
+            return fact if fact and fact.lower() != "unknown" else "unknown"
+        # Fallback: legacy XML tag
         match = re.search(r'<fact>\s*(.*?)\s*</fact>', raw, re.IGNORECASE | re.DOTALL)
         if match:
             fact = match.group(1).strip()
@@ -551,21 +778,30 @@ class DiagPRMAgentLoop(AgentLoopBase):
         return bool(deny_pattern.match(answer.strip()))
 
     def _parse_action(self, doctor_response: str) -> Optional[str]:
-        """从 doctor 回复中解析 <action> 标签。
+        """从 doctor 回复中解析 action（JSON 格式）。
         动作空间： continue / diagnose（将旧的 switch 平滑合并为 continue）
         """
+        parsed = self._parse_doctor_json(doctor_response)
+        raw = parsed.get("action", "").strip().lower()
+        if raw in ("continue", "switch", "diagnose"):
+            return "continue" if raw == "switch" else raw
+        # Fallback: legacy XML tag
         match = re.search(
             r'<action>\s*(continue|switch|diagnose)\s*</action>',
             doctor_response,
             re.IGNORECASE | re.DOTALL,
         )
         if match:
-            raw = match.group(1).strip().lower()
-            return "continue" if raw == "switch" else raw
+            raw2 = match.group(1).strip().lower()
+            return "continue" if raw2 == "switch" else raw2
         return None
 
     def _parse_question(self, doctor_response: str) -> Optional[str]:
-        """从 doctor 回复中解析 <question> 标签。"""
+        """从 doctor 回复中解析 question 字段（JSON 格式）。"""
+        parsed = self._parse_doctor_json(doctor_response)
+        if parsed.get("question"):
+            return str(parsed["question"]).strip()
+        # Fallback: legacy XML tag
         match = re.search(
             r'<question>\s*(.*?)\s*</question>',
             doctor_response,
@@ -573,10 +809,19 @@ class DiagPRMAgentLoop(AgentLoopBase):
         )
         if match:
             return match.group(1).strip()
-        # 兼容 "Question:" 格式
-        match2 = re.search(r'Question:\s*(.+)', doctor_response, re.IGNORECASE)
-        if match2:
-            return match2.group(1).strip()
+        return None
+
+    def _parse_kg_query(self, doctor_response: str) -> Optional[str]:
+        """从 doctor 回复中解析 'query_kg' 字段（JSON 格式）。
+        
+        Returns:
+            str  — 医生想查询的疾病名（原始字符串，未经 normalize）
+            None — 本轮没有 query_kg 字段
+        """
+        parsed = self._parse_doctor_json(doctor_response)
+        query = parsed.get("query_kg")
+        if query and isinstance(query, str):
+            return query.strip()
         return None
 
     def _extract_chief_complaint(self, initial_prompt: Any) -> str:
@@ -592,12 +837,10 @@ class DiagPRMAgentLoop(AgentLoopBase):
         return str(initial_prompt)
 
     def _build_initial_messages(self, chief_complaint: str) -> List:
-        """构建初始消息列表。"""
-        system_msg = SystemMessage(content=DOCTOR_SYSTEM_PROMPT.format(
+        """构建初始消息列表（兜底路径）。"""
+        system_msg = SystemMessage(content=self.doctor_system_prompt.format(
             max_turns=self.max_turns,
             current_turn=1,
         ))
-        user_msg = HumanMessage(content=DOCTOR_INITIAL_PROMPT.format(
-            chief_complaint=chief_complaint,
-        ))
+        user_msg = HumanMessage(content=chief_complaint)
         return [system_msg, user_msg]

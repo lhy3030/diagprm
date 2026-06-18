@@ -71,9 +71,13 @@ TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
 VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
 # ── 目录设置 ──────────────────────────────────────────────────────────────────
-export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard}"
-export SAVE_CHECKPOINT_DIR="${SAVE_CHECKPOINT_DIR:-./checkpoints/diagprm}"
-export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm}"
+# 每次启动生成时间戳，避免不同 run 的输出互相覆盖
+_RUN_TIMESTAMP="${_RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard/${_RUN_TIMESTAMP}}"
+export SAVE_CHECKPOINT_DIR="${SAVE_CHECKPOINT_DIR:-./checkpoints/diagprm/${_RUN_TIMESTAMP}}"
+export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm/${_RUN_TIMESTAMP}}"
+echo "[INFO] Run timestamp: ${_RUN_TIMESTAMP}"
+echo "[INFO] Output dir:    ${OUTPUT_DIR}"
 
 # HuggingFace / datasets 缓存目录（避免写入无权限的 /home/ubuntu/.cache）
 export HF_HOME="${HF_HOME:-${CODES_DIR}/.cache/huggingface}"
@@ -98,13 +102,15 @@ export NODE_RANK="${NODE_RANK:-0}"
 # ── 4 卡自动适配 ──────────────────────────────────────────────────────────────
 # 当 N_GPUS=4 时，自动缩减 batch size / mini batch / agent workers
 if [ "${N_GPUS}" -le 4 ]; then
-    : "${TRAIN_BATCH_SIZE_OVERRIDE:=32}"
-    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=32}"
+    # G=4 doubles rollout count compared with the old G=2 setting, so keep
+    # the number of prompts per update conservative on 4-GPU runs.
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=16}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=16}"
     : "${AGENT_NUM_WORKERS_OVERRIDE:=4}"
     : "${INFER_TP_OVERRIDE:=2}"
 else
-    : "${TRAIN_BATCH_SIZE_OVERRIDE:=64}"
-    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=64}"
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=32}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=32}"
     : "${AGENT_NUM_WORKERS_OVERRIDE:=8}"
     : "${INFER_TP_OVERRIDE:=2}"
 fi
@@ -129,7 +135,7 @@ train_batch_size=${TRAIN_BATCH_SIZE_OVERRIDE}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE_OVERRIDE}
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_resp_per_prompt=2    # 从4降到2：配合 max_response_length=4096，避免 actor_max_token_len 超显存
+n_resp_per_prompt=${N_RESP_PER_PROMPT_OVERRIDE:-4}  # GRPO group size G；可设为 8 做主实验大组对比
 n_resp_per_prompt_val=1
 
 # ── 性能配置 ──────────────────────────────────────────────────────────────────
@@ -163,6 +169,8 @@ echo "  KG: ${KG_PATH}"
 echo "  Nodes: ${NNODES} x ${N_GPUS} GPUs"
 echo "  adv_estimator: ${adv_estimator}"
 echo "  G (rollouts per prompt): ${n_resp_per_prompt}"
+echo "  prompt batch size: ${train_batch_size}"
+echo "  rollout batch size: $(( train_batch_size * n_resp_per_prompt ))"
 echo "  max_turns: ${max_turns}"
 echo "============================================================"
 
@@ -214,7 +222,7 @@ python3 -m recipe.diagprm.diagprm_main \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.temperature=1.0 \

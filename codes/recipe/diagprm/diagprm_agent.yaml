@@ -2,6 +2,9 @@
   _target_: recipe.diagprm.diagprm_agent_loop.DiagPRMAgentLoop
   max_turns: 10
   verifier_enabled: true
+  # Clean main setting: Doctor cannot observe the oracle KG.
+  # Set true only for KG-tool ablations.
+  kg_tool_enabled: false
   # Patient simulator LLM API (OpenAI-compatible)
   # Can also be set via environment variables: PATIENT_API_BASE, PATIENT_MODEL, PATIENT_API_KEY
   patient_api_base: "http://localhost:8001/v1"

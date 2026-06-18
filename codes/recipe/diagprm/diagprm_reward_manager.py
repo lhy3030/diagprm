@@ -63,6 +63,12 @@ class DiagPRMRewardManager(AbstractRewardManager):
             "tau": 0.5,         # 过早确诊 KG 覆盖率阈值
             "format_score": 0.1,
             "weighted": True,
+            "evidence_gated_hyp": True,
+            "wrong_hyp_penalty_scale": 0.5,
+            "r_wrong_diag": -1.0,
+            "r_timeout": -1.0,
+            "unknown_penalty": -0.05,
+            "duplicate_penalty": -0.05,
         }
         if reward_coefficients:
             self.reward_params.update(reward_coefficients)
@@ -111,6 +117,8 @@ class DiagPRMRewardManager(AbstractRewardManager):
             # New schema: top-level "disease" field (string).
             # Old schema: reward_model.ground_truth.disease (dict).
             ground_truth = data_item.non_tensor_batch.get("disease", None)
+            initial_symptoms = data_item.non_tensor_batch.get("initial_symptoms", None)
+            gt_field = {}
             if not ground_truth:
                 rm_info = data_item.non_tensor_batch.get("reward_model", {})
                 if isinstance(rm_info, str):
@@ -121,9 +129,18 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 gt_field = rm_info.get("ground_truth", "")
                 if isinstance(gt_field, dict):
                     ground_truth = gt_field.get("disease", gt_field.get("answer", ""))
+                    if initial_symptoms is None:
+                        initial_symptoms = gt_field.get("initial_symptoms", [])
                 else:
                     ground_truth = str(gt_field)
             ground_truth = str(ground_truth or "unknown")
+            if isinstance(initial_symptoms, str):
+                try:
+                    initial_symptoms = json.loads(initial_symptoms)
+                except Exception:
+                    initial_symptoms = [initial_symptoms]
+            if initial_symptoms is None:
+                initial_symptoms = []
 
             num_turn = data_item.non_tensor_batch.get("__num_turns__", None)
 
@@ -147,12 +164,23 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     ground_truth=ground_truth,
                     kg=kg,
                     reward_params=self.reward_params,
+                    initial_symptoms=initial_symptoms,
                 )
-                # 构造 turns_info 用于后续 tensor 写入（复用位置为 end_of_response）
-                # 状态摘要模式下只有一轮 response，把所有 reward 聚合到最后位置
-                turns_info = self._build_turns_info_from_history(
-                    dialogue_history, response_mask, response_ids
+                # 位置仍从真实 full-history response_mask 解析，确保每轮 reward
+                # 写回该轮 Doctor response 的 token span，而不是聚合到最后一轮。
+                turns_info = parse_turns_from_response_mask(
+                    response_mask, response_ids, self.tokenizer
                 )
+                if len(turns_info) != len(total_rewards):
+                    print(
+                        f"[Warning] Dialogue/token turn mismatch: "
+                        f"history={len(total_rewards)}, mask={len(turns_info)}"
+                    )
+                    keep = min(len(turns_info), len(total_rewards))
+                    turns_info = turns_info[:keep]
+                    total_rewards = total_rewards[:keep]
+                    r_diag_list = r_diag_list[:keep]
+                    details_list = details_list[:keep]
             else:
                 # 方案B fallback：从 response_mask 解析（传统多轮拼接模式）
                 turns_info = parse_turns_from_response_mask(
@@ -182,6 +210,7 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     ground_truth=ground_truth,
                     kg=kg,
                     reward_params=self.reward_params,
+                    initial_symptoms=initial_symptoms,
                 )
 
             if not turns_info:

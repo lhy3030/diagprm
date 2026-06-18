@@ -129,6 +129,10 @@ def calculate_turn_reward(
     tau: float = 0.5,         # 最低 KG 覆盖率阈值（过早确诊惩罚）
     format_score: float = 0.1,
     weighted: bool = True,
+    evidence_gated_hyp: bool = True,
+    wrong_hyp_penalty_scale: float = 0.5,
+    r_wrong_diag: float = -1.0,
+    r_timeout: float = -1.0,
 ) -> Dict:
     """
     计算单轮的完整 DiagPRM reward。
@@ -145,8 +149,8 @@ def calculate_turn_reward(
         r_diag(k) : 确诊奖励（仅 is_final_turn 时非零）
           - 正确诊断且覆盖率充分 : +r_max
           - 正确诊断但覆盖率不足 : +r_max * 0.5（过早确诊）
-          - 诊断错误              : 0
-          - 超时未确诊            : -1.0
+          - 诊断错误              : r_wrong_diag
+          - 超时未确诊            : r_timeout
 
     Returns:
         dict with keys:
@@ -174,10 +178,16 @@ def calculate_turn_reward(
     }
 
     # ── 1. 格式检查 ──────────────────────────────────────────────────────────
-    # 检查是否包含 <think>...</think> 且有合法 action
-    think_match = re.search(r'<think>.*?</think>', model_response, re.DOTALL | re.IGNORECASE)
+    # 检查是否包含合法 JSON（有 thought/hypothesis/action 字段）
+    from recipe.diagprm.kg_utils import _parse_json_from_output
+    parsed_json = _parse_json_from_output(model_response)
+    json_valid = bool(
+        parsed_json
+        and parsed_json.get("action") in ("continue", "diagnose", "switch")
+        and ("hypothesis" in parsed_json or "diagnosis" in parsed_json)
+    )
     action_match = action is not None
-    if think_match and action_match:
+    if json_valid and action_match:
         details["has_valid_format"] = True
         format_reward = format_score
     else:
@@ -199,10 +209,15 @@ def calculate_turn_reward(
     r_hyp = 0.0
     if curr_hypothesis is not None:
         # 比较主假设与 GT（允许模糊包含匹配）
-        if gt_norm and (gt_norm in curr_hypothesis or curr_hypothesis in gt_norm):
-            r_hyp = gamma1
+        hyp_match = bool(gt_norm and (gt_norm in curr_hypothesis or curr_hypothesis in gt_norm))
+        if evidence_gated_hyp:
+            # 正确假设只有在本轮带来新增 GT evidence 时才奖励，避免早猜刷分。
+            if hyp_match and delta_kg > 0:
+                r_hyp = gamma1
+            elif (not hyp_match) and action == "continue":
+                r_hyp = -gamma1 * wrong_hyp_penalty_scale
         else:
-            r_hyp = -gamma1
+            r_hyp = gamma1 if hyp_match else -gamma1
     details["r_hyp"] = r_hyp
 
     # ── 4. 合并 Turn 奖励 ────────────────────────────────────────────────────
@@ -229,10 +244,10 @@ def calculate_turn_reward(
                     details["premature_diagnosis"] = True
             else:
                 # 错误诊断
-                r_diag = 0.0
+                r_diag = r_wrong_diag
         else:
             # 达到最大轮次仍是 continue / None（未触发 diagnose）→ 超时惩罚
-            r_diag = -1.0
+            r_diag = r_timeout
     details["r_diag"] = r_diag
 
     # ── 6. 最终合并：r(k) = turn_coef * r_turn + r_diag ─────────────────────
@@ -308,6 +323,7 @@ def compute_episode_rewards_from_history(
     ground_truth: str,              # ground truth 疾病名
     kg: Dict,                       # master_kg
     reward_params: Dict,            # 奖励系数字典
+    initial_symptoms: Optional[List[str]] = None,
 ) -> Tuple[List[float], List[float], List[Dict]]:
     """
     从 dialogue_history 直接计算每轮 reward，无需解析 token mask。
@@ -324,13 +340,23 @@ def compute_episode_rewards_from_history(
 
     gt_norm = _normalize(ground_truth)
     collected_symptoms: Set[str] = set()
+    disease_syms = kg.get(gt_norm, {})
+    for sym in initial_symptoms or []:
+        norm_sym = _normalize(sym)
+        if norm_sym in disease_syms:
+            collected_symptoms.add(norm_sym)
 
     total_rewards = []
     r_diag_list = []
     details_list = []
 
     prev_hypothesis: Optional[str] = None
-    _params = {k: v for k, v in reward_params.items() if k != "lam"}
+    _params = {
+        k: v for k, v in reward_params.items()
+        if k not in {"lam", "unknown_penalty", "duplicate_penalty"}
+    }
+    unknown_penalty = float(reward_params.get("unknown_penalty", -0.05))
+    duplicate_penalty = float(reward_params.get("duplicate_penalty", -0.05))
 
     for turn_idx, entry in enumerate(dialogue_history):
         doctor_response = entry.get("doctor_response", "")
@@ -345,9 +371,11 @@ def compute_episode_rewards_from_history(
         # 1. Try direct normalised lookup in this disease's symptom dict (fastest).
         # 2. Fall back to full KG n-gram extraction (covers edge cases / legacy data).
         prev_symptoms = set(collected_symptoms)
+        is_unknown_fact = patient_fact.lower() == "unknown" or not patient_fact.strip()
+        is_duplicate_fact = False
         if patient_fact.lower() != "unknown" and patient_fact.strip():
             norm_fact = _normalize(patient_fact)
-            disease_syms = kg.get(gt_norm, {})
+            is_duplicate_fact = norm_fact in collected_symptoms
             if norm_fact in disease_syms:
                 # Direct hit: verbatim KG key for this disease
                 collected_symptoms.add(norm_fact)
@@ -373,6 +401,13 @@ def compute_episode_rewards_from_history(
             is_final_turn=is_final,
             **_params,
         )
+
+        if (not is_final) and is_unknown_fact:
+            turn_result["total_reward"] += unknown_penalty
+            turn_result["details"]["unknown_penalty"] = unknown_penalty
+        if (not is_final) and is_duplicate_fact:
+            turn_result["total_reward"] += duplicate_penalty
+            turn_result["details"]["duplicate_penalty"] = duplicate_penalty
 
         total_rewards.append(turn_result["total_reward"])
         r_diag_list.append(turn_result["r_diag"])
@@ -402,6 +437,7 @@ def compute_episode_rewards(
     ground_truth: str,                # ground truth 疾病名
     kg: Dict,                         # master_kg
     reward_params: Dict,              # 奖励系数字典
+    initial_symptoms: Optional[List[str]] = None,
 ) -> Tuple[List[float], List[float], List[Dict]]:
     """
     对整条轨迹计算每轮的 total_reward（含 turn_coef）和 r_diag。
@@ -417,12 +453,19 @@ def compute_episode_rewards(
     """
     gt_norm = _normalize(ground_truth)
     collected_symptoms: Set[str] = set()
+    disease_syms = kg.get(gt_norm, {})
+    for sym in initial_symptoms or []:
+        norm_sym = _normalize(sym)
+        if norm_sym in disease_syms:
+            collected_symptoms.add(norm_sym)
 
     total_rewards = []
     r_diag_list = []
     details_list = []
 
     prev_hypothesis: Optional[str] = None
+    unknown_penalty = float(reward_params.get("unknown_penalty", -0.05))
+    duplicate_penalty = float(reward_params.get("duplicate_penalty", -0.05))
 
     for turn_idx, turn_info in enumerate(turns_info):
         model_response = turn_info["response"]
@@ -437,13 +480,21 @@ def compute_episode_rewards(
 
         # 更新症状集合：把患者回答里确认的症状加入 collected
         prev_symptoms = set(collected_symptoms)
+        matched_before = set(collected_symptoms)
         if human_resp:
             collected_symptoms = update_collected_symptoms(
                 collected_symptoms, human_resp, question or "", kg
             )
+        is_unknown_fact = bool(human_resp) and collected_symptoms == prev_symptoms
+        is_duplicate_fact = bool(human_resp) and matched_before == collected_symptoms and bool(
+            extract_symptoms_from_text((question or "") + " " + human_resp, kg) & matched_before
+        )
 
         # 计算本轮 reward（过滤掉 lam 参数，因为已去掉 r_switch）
-        _params = {k: v for k, v in reward_params.items() if k != "lam"}
+        _params = {
+            k: v for k, v in reward_params.items()
+            if k not in {"lam", "unknown_penalty", "duplicate_penalty"}
+        }
         turn_result = calculate_turn_reward(
             model_response=model_response,
             human_response=human_resp,
@@ -457,6 +508,13 @@ def compute_episode_rewards(
             is_final_turn=is_final,
             **_params,
         )
+
+        if (not is_final) and is_unknown_fact:
+            turn_result["total_reward"] += unknown_penalty
+            turn_result["details"]["unknown_penalty"] = unknown_penalty
+        if (not is_final) and is_duplicate_fact:
+            turn_result["total_reward"] += duplicate_penalty
+            turn_result["details"]["duplicate_penalty"] = duplicate_penalty
 
         total_rewards.append(turn_result["total_reward"])
         r_diag_list.append(turn_result["r_diag"])
