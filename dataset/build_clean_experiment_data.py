@@ -270,6 +270,13 @@ CC_TEMPLATES = [
 ]
 
 
+def build_symptom_facts(symptoms: Dict[str, float]) -> List[dict]:
+    return [
+        {"fact_id": f"F{i:03d}", "text": symptom, "weight": float(weight)}
+        for i, (symptom, weight) in enumerate(symptoms.items())
+    ]
+
+
 def build_sample(idx: int, split: str, disease: str, symptoms: Dict[str, float], rng: random.Random):
     initial = sample_initial_symptoms(symptoms, rng, 1, 3)
     chief = rng.choice(CC_TEMPLATES).format(symptoms=", ".join(initial))
@@ -280,6 +287,7 @@ def build_sample(idx: int, split: str, disease: str, symptoms: Dict[str, float],
         "chief_complaint": chief,
         "initial_symptoms": initial,
         "symptoms_pool": symptoms,
+        "symptom_facts": build_symptom_facts(symptoms),
         "split": split,
         "visible_kg_policy": "none_by_default",
         "data_source": "kg_clean_v2",
@@ -306,6 +314,7 @@ def to_parquet_rows(samples: List[dict], max_turns: int):
                 "disease_id": s["disease_id"],
                 "disease_group": s["disease_group"],
                 "symptoms_pool": s["symptoms_pool"],
+                "symptom_facts": s["symptom_facts"],
                 "initial_symptoms": s["initial_symptoms"],
                 "split": s["split"],
             }
@@ -317,6 +326,7 @@ def to_parquet_rows(samples: List[dict], max_turns: int):
             "chief_complaint": s["chief_complaint"],
             "initial_symptoms": s["initial_symptoms"],
             "n_symptoms_pool": len(s["symptoms_pool"]),
+            "n_symptom_facts": len(s["symptom_facts"]),
             "visible_kg_policy": s["visible_kg_policy"],
         }
         rows.append({
@@ -375,6 +385,7 @@ def write_report(path: Path, report: dict, splits: dict, clean_kg: dict, manifes
         "## Notes",
         "",
         "- Patient and Reward Manager may access hidden `symptoms_pool` and `disease`.",
+        "- Patient emits hidden `fact_id`; Reward Manager resolves it through `symptom_facts` / `fact_id_to_text`.",
         "- Doctor policy receives only chief complaint and subsequent dialogue unless a KG tool condition is explicitly enabled.",
         "- Initial symptoms define S0 and should not be rewarded as Doctor-discovered evidence.",
     ])

@@ -5,7 +5,7 @@ Implements the async multi-turn diagnostic dialogue between the Doctor Agent and
 
 Dialogue protocol (each turn):
   Doctor  : JSON block with keys: thought, hypothesis, confirmed, action, question/diagnosis
-  Patient : JSON block with keys: answer, fact
+  Patient : JSON block with keys: answer, fact_id
 
 Doctor Agent prompt format (full-history multi-turn mode):
   System prompt : role description + output format (DOCTOR_SYSTEM_PROMPT, updated each turn with current_turn)
@@ -18,7 +18,7 @@ State tracking (Agent Loop side):
   new_finding          : new symptoms added this turn (or "No new findings" for invalid questions)
 
 Patient Simulator:
-  - Uses atomic_facts from the dataset
+  - Uses hidden symptom facts from the dataset
   - Calls an external OpenAI-compatible API (patient_api_base / patient_model config)
   - Falls back to rule-based matching if the API call fails
 """
@@ -57,7 +57,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
     
     继承自 ATPO 的 AgentLoopBase，重写对话逻辑以支持：
       - Doctor Agent 的结构化 CoT 格式（<hypothesis name="...">, <action>）
-      - Patient Simulator（基于 atomic_facts 的规则 + LLM 混合问答）
+      - Patient Simulator（基于 hidden symptom facts 的规则 + LLM 混合问答）
       - Verifier（检测重复/多重问题）
       - 最大轮次控制
 
@@ -144,7 +144,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
             except Exception:
                 raw_prompt = []
 
-        # reward_model 包含 ground_truth（disease, atomic_facts）
+        # reward_model 包含 ground_truth（disease, symptoms_pool / symptom_facts）
         reward_model = kwargs.get("reward_model", {})
         if isinstance(reward_model, str):
             try:
@@ -167,22 +167,17 @@ class DiagPRMAgentLoop(AgentLoopBase):
             or ground_truth.get("initial_symptoms", [])
         )
 
-        # Patient's full fact sheet = complete symptoms_pool (all KG verbatim keys).
-        # This allows the Patient to answer ANY symptom the Doctor asks about,
-        # not just the 1-3 revealed in the chief complaint.
-        # <fact> will be a verbatim copy of a symptoms_pool key -> direct KG match.
+        # Patient's full private fact sheet = complete symptoms_pool (all KG verbatim
+        # keys). We expose ids to the Patient simulator and keep the id->text map
+        # hidden from the Doctor. The Reward Manager resolves patient_fact_id using
+        # this map, so Doctor only sees natural-language answers.
         symptoms_pool = (
             kwargs.get("symptoms_pool")
             or ground_truth.get("symptoms_pool", {})
         )
-        if symptoms_pool:
-            # Use all symptom keys (KG verbatim strings) as the Patient's fact sheet
-            atomic_facts = list(symptoms_pool.keys())
-        else:
-            # Back-compat: old format stored "atomic_facts" as sentences
-            atomic_facts_legacy = ground_truth.get("atomic_facts", [])
-            atomic_facts = initial_symptoms if initial_symptoms else atomic_facts_legacy
-
+        symptom_facts = self._build_symptom_facts(symptoms_pool, initial_symptoms, ground_truth)
+        fact_id_to_text = {f["fact_id"]: f["text"] for f in symptom_facts}
+        fact_text_to_id = {f["text"]: f["fact_id"] for f in symptom_facts}
         # chief_complaint: prefer top-level field (new schema), else parse from prompt
         chief_complaint = (
             kwargs.get("chief_complaint")
@@ -198,7 +193,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         collected_symptoms: List[str] = []   # 累积确认的症状（KG 匹配用）
         current_hypothesis: str = ""         # 上一轮 Doctor 输出的假设名
         last_ai_msg = None                   # 保留最后一条 AIMessage（用于提取 token ids）
-        dialogue_history: List[dict] = []    # 每轮 {turn_id, doctor_response, patient_answer, fact}
+        dialogue_history: List[dict] = []    # 每轮 {turn_id, doctor_response, patient_answer, patient_fact_id}
 
         # ── 第 0 步：Patient Agent 生成自然语言主诉开场白 ────────────────────
         patient_opening = await self._llm_patient_opening(initial_symptoms)
@@ -333,7 +328,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
                         "turn_id": turn_idx,
                         "doctor_response": doctor_response,
                         "patient_answer": "",
-                        "patient_fact": "",
+                        "patient_fact_id": "unknown",
                         "is_final": True,
                     })
                     break
@@ -363,7 +358,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
                         "turn_id": turn_idx,
                         "doctor_response": doctor_response,
                         "patient_answer": "",
-                        "patient_fact": "unknown",
+                        "patient_fact_id": "unknown",
                     })
                     continue
                 elif verifier_tag == "<Multiple>":
@@ -374,24 +369,31 @@ class DiagPRMAgentLoop(AgentLoopBase):
                         "turn_id": turn_idx,
                         "doctor_response": doctor_response,
                         "patient_answer": "",
-                        "patient_fact": "unknown",
+                        "patient_fact_id": "unknown",
                     })
                     continue
 
                 # ── Patient Simulator 回答（LLM API）──────────────────────────
-                patient_raw = await self._llm_patient(atomic_facts, question)
+                patient_raw = await self._llm_patient(symptom_facts, question)
 
-                # 解析 patient 回复中的 answer 和 fact 字段
+                # 解析 patient 回复中的 answer 和 hidden fact_id 字段
                 patient_answer = self._parse_patient_answer(patient_raw)
-                patient_fact   = self._parse_patient_fact(patient_raw)
+                patient_fact_id = self._parse_patient_fact_id(
+                    patient_raw,
+                    fact_id_to_text=fact_id_to_text,
+                    fact_text_to_id=fact_text_to_id,
+                )
+                patient_fact_text = fact_id_to_text.get(patient_fact_id, "")
 
                 # ── 将 patient 回答追加到对话历史 ────────────────────────────
+                # Doctor 只看到自然语言 answer；hidden fact_id/text 只进入
+                # statistics，供 Reward Manager 和 rollout debug 使用。
                 messages.append(HumanMessage(content=patient_answer))
 
                 # ── 更新累积症状（供 reward 计算用）──────────────────────────
-                if patient_fact and patient_fact.lower() != "unknown":
-                    if patient_fact not in collected_symptoms:
-                        collected_symptoms.append(patient_fact)
+                if patient_fact_text:
+                    if patient_fact_text not in collected_symptoms:
+                        collected_symptoms.append(patient_fact_text)
 
                 previous_questions.append(question)
 
@@ -400,7 +402,8 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     "turn_id": turn_idx,
                     "doctor_response": doctor_response,
                     "patient_answer": patient_answer,
-                    "patient_fact": patient_fact,  # 原子事实或 "unknown"
+                    "patient_fact_id": patient_fact_id,  # hidden fact id or "unknown"
+                    "patient_fact_text": patient_fact_text,  # hidden debug/resolution text
                 })
 
         except MaxTokenExceededError:
@@ -493,9 +496,11 @@ class DiagPRMAgentLoop(AgentLoopBase):
             statistics={
                 "disease": disease,
                 "turn_count": effective_turn_count,
-                # 完整对话轨迹：供 Reward Manager 直接计算 turn-level reward
-                # 每条记录: {turn_id, doctor_response, patient_answer, patient_fact, [is_final]}
+                # 完整对话轨迹：供 Reward Manager 直接计算 turn-level reward。
+                # Doctor 可见字段只有 doctor_response / patient_answer；
+                # patient_fact_id 和 fact_id_to_text 是 hidden oracle signal。
                 "dialogue_history": dialogue_history,
+                "fact_id_to_text": fact_id_to_text,
                 # _update_statistics 需要这三个键（可以为空列表）
                 "q_value_variance_list": [],
                 "mdp_value_list": [],
@@ -506,7 +511,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
     async def _llm_patient(
         self,
-        atomic_facts: List[str],
+        symptom_facts: List[Dict[str, Any]],
         question: str,
     ) -> str:
         """
@@ -516,9 +521,11 @@ class DiagPRMAgentLoop(AgentLoopBase):
         (containing the atomic facts) and the doctor's question as the user message.
         Falls back to a simple rule-based answer if the API call fails.
         """
-        # atomic_facts is now a list of KG verbatim symptom strings.
-        # Format them as bullet points for the Patient Simulator prompt.
-        facts_text = "\n".join(f"- {f}" for f in atomic_facts) if atomic_facts else "(no known facts)"
+        # Format the hidden fact sheet as id: symptom. The Patient returns only
+        # fact_id, while the Doctor receives only the natural-language answer.
+        facts_text = "\n".join(
+            f"- {f['fact_id']}: {f['text']}" for f in symptom_facts
+        ) if symptom_facts else "(no known facts)"
         system_content = PATIENT_SYSTEM_PROMPT.format(atomic_facts=facts_text)
 
         payload = {
@@ -553,12 +560,12 @@ class DiagPRMAgentLoop(AgentLoopBase):
         except Exception as e:
             print(f"[Patient API] call failed: {e}")
 
-        # Fallback: simple keyword match against atomic_facts
-        return self._rule_based_patient_fallback(atomic_facts, question)
+        # Fallback: simple keyword match against hidden symptom facts.
+        return self._rule_based_patient_fallback(symptom_facts, question)
 
     def _rule_based_patient_fallback(
         self,
-        atomic_facts: List[str],
+        symptom_facts: List[Dict[str, Any]],
         question: str,
     ) -> str:
         """Fallback rule-based patient answer used when the LLM API is unavailable."""
@@ -567,11 +574,83 @@ class DiagPRMAgentLoop(AgentLoopBase):
         keywords -= {"have", "does", "your", "you", "the", "any", "this", "that",
                      "please", "tell", "about", "been", "feel", "experiencing",
                      "patient", "currently", "present", "symptom", "condition"}
-        if atomic_facts and keywords:
-            for fact in atomic_facts:
-                if any(kw in fact.lower() for kw in keywords):
-                    return "Yes, " + fact
-        return "I'm not sure about that."
+        if symptom_facts and keywords:
+            for fact in symptom_facts:
+                fact_text = fact["text"]
+                if any(kw in fact_text.lower() for kw in keywords):
+                    return json.dumps(
+                        {
+                            "answer": f"Yes, I have been experiencing {fact_text}.",
+                            "fact_id": fact["fact_id"],
+                        },
+                        ensure_ascii=False,
+                    )
+        return json.dumps(
+            {"answer": "I'm not sure about that.", "fact_id": "unknown"},
+            ensure_ascii=False,
+        )
+
+    def _build_symptom_facts(
+        self,
+        symptoms_pool: Any,
+        initial_symptoms: List[str],
+        ground_truth: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build a stable hidden fact sheet [{fact_id, text, weight}, ...]."""
+        raw_facts = ground_truth.get("symptom_facts", None)
+        if isinstance(raw_facts, str):
+            try:
+                raw_facts = json.loads(raw_facts)
+            except Exception:
+                raw_facts = None
+        if isinstance(raw_facts, list) and raw_facts:
+            facts = []
+            for idx, item in enumerate(raw_facts):
+                if isinstance(item, dict):
+                    text = str(item.get("text", "")).strip()
+                    if not text:
+                        continue
+                    facts.append({
+                        "fact_id": str(item.get("fact_id") or f"F{idx:03d}"),
+                        "text": text,
+                        "weight": float(item.get("weight", 1.0)),
+                    })
+            if facts:
+                return facts
+
+        items: List[Tuple[str, float]] = []
+        if isinstance(symptoms_pool, str):
+            try:
+                symptoms_pool = json.loads(symptoms_pool)
+            except Exception:
+                symptoms_pool = {}
+        if isinstance(symptoms_pool, dict) and symptoms_pool:
+            items = [(str(sym), float(weight)) for sym, weight in symptoms_pool.items()]
+        else:
+            legacy = ground_truth.get("atomic_facts", None)
+            if isinstance(legacy, str):
+                try:
+                    legacy = json.loads(legacy)
+                except Exception:
+                    legacy = [legacy]
+            if isinstance(legacy, list) and legacy:
+                items = [(str(sym), 1.0) for sym in legacy]
+            else:
+                items = [(str(sym), 1.0) for sym in (initial_symptoms or [])]
+
+        facts = []
+        seen = set()
+        for text, weight in items:
+            text = text.strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            facts.append({
+                "fact_id": f"F{len(facts):03d}",
+                "text": text,
+                "weight": float(weight),
+            })
+        return facts
 
     async def _llm_patient_opening(
         self,
@@ -767,6 +846,31 @@ class DiagPRMAgentLoop(AgentLoopBase):
         if match:
             fact = match.group(1).strip()
             return fact if fact else "unknown"
+        return "unknown"
+
+    def _parse_patient_fact_id(
+        self,
+        raw: str,
+        fact_id_to_text: Dict[str, str],
+        fact_text_to_id: Dict[str, str],
+    ) -> str:
+        """Extract hidden fact_id from patient output, with legacy fact fallback."""
+        parsed = self._parse_patient_json(raw)
+        if "fact_id" in parsed:
+            fact_id = str(parsed["fact_id"]).strip()
+            if not fact_id or fact_id.lower() == "unknown":
+                return "unknown"
+            return fact_id if fact_id in fact_id_to_text else "unknown"
+
+        # Backward compatibility for old patient prompts that returned verbatim fact.
+        legacy_fact = self._parse_patient_fact(raw)
+        if legacy_fact and legacy_fact.lower() != "unknown":
+            if legacy_fact in fact_text_to_id:
+                return fact_text_to_id[legacy_fact]
+            norm_legacy = legacy_fact.strip().lower()
+            for text, fact_id in fact_text_to_id.items():
+                if text.strip().lower() == norm_legacy:
+                    return fact_id
         return "unknown"
 
     def _is_negative_answer(self, answer: str) -> bool:

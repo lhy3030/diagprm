@@ -319,18 +319,20 @@ def update_collected_symptoms(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_episode_rewards_from_history(
-    dialogue_history: List[Dict],   # Agent Loop 传入的 [{turn_id, doctor_response, patient_answer, patient_fact, ...}]
+    dialogue_history: List[Dict],   # Agent Loop 传入的 [{turn_id, doctor_response, patient_answer, patient_fact_id, ...}]
     ground_truth: str,              # ground truth 疾病名
     kg: Dict,                       # master_kg
     reward_params: Dict,            # 奖励系数字典
     initial_symptoms: Optional[List[str]] = None,
+    fact_id_to_text: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[float], List[float], List[Dict]]:
     """
     从 dialogue_history 直接计算每轮 reward，无需解析 token mask。
 
-    patient_fact 字段：
-      - 原子事实字符串（如 "chest pain"）→ 做 KG n-gram 匹配提取症状
+    hidden patient_fact_id 字段：
+      - fact id（如 "F003"）→ 通过 fact_id_to_text 精确解析为 KG 症状
       - "unknown" → 无效提问，本轮 delta_kg = 0，症状集合不更新
+      - 旧数据的 patient_fact 字符串仍作为 fallback 支持
 
     奖励结构（每轮）：
         r(k) = turn_coef * r_turn(k) + r_diag(k)
@@ -349,6 +351,7 @@ def compute_episode_rewards_from_history(
     total_rewards = []
     r_diag_list = []
     details_list = []
+    fact_id_to_text = fact_id_to_text or {}
 
     prev_hypothesis: Optional[str] = None
     _params = {
@@ -360,7 +363,17 @@ def compute_episode_rewards_from_history(
 
     for turn_idx, entry in enumerate(dialogue_history):
         doctor_response = entry.get("doctor_response", "")
-        patient_fact    = entry.get("patient_fact", "unknown") or "unknown"
+        patient_fact_id = str(entry.get("patient_fact_id", "unknown") or "unknown").strip()
+        patient_fact = ""
+        if patient_fact_id and patient_fact_id.lower() != "unknown":
+            patient_fact = fact_id_to_text.get(patient_fact_id, "")
+        if not patient_fact:
+            # Hidden debug field from new agent loop, then legacy verbatim field.
+            patient_fact = (
+                entry.get("patient_fact_text", "")
+                or entry.get("patient_fact", "unknown")
+                or "unknown"
+            )
         is_final        = entry.get("is_final", turn_idx == len(dialogue_history) - 1)
 
         # 解析本轮 action 和 hypothesis
@@ -408,6 +421,8 @@ def compute_episode_rewards_from_history(
         if (not is_final) and is_duplicate_fact:
             turn_result["total_reward"] += duplicate_penalty
             turn_result["details"]["duplicate_penalty"] = duplicate_penalty
+        turn_result["details"]["patient_fact_id"] = patient_fact_id
+        turn_result["details"]["patient_fact"] = patient_fact if patient_fact != "unknown" else ""
 
         total_rewards.append(turn_result["total_reward"])
         r_diag_list.append(turn_result["r_diag"])

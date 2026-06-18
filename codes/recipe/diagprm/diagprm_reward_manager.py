@@ -156,6 +156,9 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     statistics = {}
 
             dialogue_history = statistics.get("dialogue_history", None)
+            fact_id_to_text = statistics.get("fact_id_to_text", {}) if isinstance(statistics, dict) else {}
+            if not isinstance(fact_id_to_text, dict):
+                fact_id_to_text = {}
 
             if dialogue_history:
                 # 方案A：直接从对话历史计算（推荐，无 token 解析歧义）
@@ -165,6 +168,7 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     kg=kg,
                     reward_params=self.reward_params,
                     initial_symptoms=initial_symptoms,
+                    fact_id_to_text=fact_id_to_text,
                 )
                 # 位置仍从真实 full-history response_mask 解析，确保每轮 reward
                 # 写回该轮 Doctor response 的 token span，而不是聚合到最后一轮。
@@ -202,6 +206,17 @@ class DiagPRMRewardManager(AbstractRewardManager):
                         "outcome_reward": 0.0,
                         "turn_hypotheses": [],
                     })
+                    reward_extra_info["diagprm_trajectory"].append(
+                        self._build_diagprm_trajectory(
+                            ground_truth=ground_truth,
+                            initial_symptoms=initial_symptoms,
+                            dialogue_history=[],
+                            fact_id_to_text={},
+                            details_list=[],
+                            total_rewards=[],
+                            final_r_diag=0.0,
+                        )
+                    )
                     continue
 
                 total_rewards, r_diag_list, details_list = compute_episode_rewards(
@@ -223,6 +238,17 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     "outcome_reward": 0.0,
                     "turn_hypotheses": [],
                 })
+                reward_extra_info["diagprm_trajectory"].append(
+                    self._build_diagprm_trajectory(
+                        ground_truth=ground_truth,
+                        initial_symptoms=initial_symptoms,
+                        dialogue_history=dialogue_history or [],
+                        fact_id_to_text=fact_id_to_text,
+                        details_list=[],
+                        total_rewards=[],
+                        final_r_diag=0.0,
+                    )
+                )
                 continue
 
             # 将 total_reward 写入 tensor 的对应位置（end_position）
@@ -263,6 +289,17 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 "outcome_reward": final_r_diag,
                 "turn_hypotheses": turn_hypotheses,     # 每轮的 primary hypothesis（假设感知分组用）
             })
+            reward_extra_info["diagprm_trajectory"].append(
+                self._build_diagprm_trajectory(
+                    ground_truth=ground_truth,
+                    initial_symptoms=initial_symptoms,
+                    dialogue_history=dialogue_history or [],
+                    fact_id_to_text=fact_id_to_text,
+                    details_list=details_list,
+                    total_rewards=total_rewards,
+                    final_r_diag=final_r_diag,
+                )
+            )
 
         if return_dict:
             return {
@@ -309,6 +346,54 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 "length": 1,
             })
         return turns
+
+    def _build_diagprm_trajectory(
+        self,
+        ground_truth: str,
+        initial_symptoms: list,
+        dialogue_history: list,
+        fact_id_to_text: dict,
+        details_list: list,
+        total_rewards: list,
+        final_r_diag: float,
+    ) -> dict:
+        """
+        Compact JSON-serialisable trajectory for rollout inspection.
+
+        `visible` is what the Doctor actually saw. `hidden` is oracle-side signal
+        for reward/debug only and must not be fed back into the Doctor prompt.
+        """
+        turns = []
+        for idx, entry in enumerate(dialogue_history or []):
+            detail = details_list[idx] if idx < len(details_list) else {}
+            fact_id = str(entry.get("patient_fact_id", "unknown") or "unknown")
+            hidden_fact = fact_id_to_text.get(fact_id, entry.get("patient_fact_text", ""))
+            turns.append({
+                "turn_id": entry.get("turn_id", idx),
+                "visible": {
+                    "doctor_response": entry.get("doctor_response", ""),
+                    "patient_answer": entry.get("patient_answer", ""),
+                },
+                "hidden": {
+                    "patient_fact_id": fact_id,
+                    "patient_fact_text": hidden_fact,
+                    "is_final": bool(entry.get("is_final", idx == len(dialogue_history) - 1)),
+                },
+                "reward": {
+                    "total": float(total_rewards[idx]) if idx < len(total_rewards) else 0.0,
+                    "r_turn": float(detail.get("r_turn", 0.0)),
+                    "delta_kg": float(detail.get("delta_kg", 0.0)),
+                    "r_hyp": float(detail.get("r_hyp", 0.0)),
+                    "r_diag": float(detail.get("r_diag", 0.0)),
+                    "coverage_after": float(detail.get("coverage_after", 0.0)),
+                },
+            })
+        return {
+            "ground_truth": ground_truth,
+            "initial_symptoms": initial_symptoms or [],
+            "final_r_diag": float(final_r_diag),
+            "turns": turns,
+        }
 
     def _update_detailed_metrics(
         self,

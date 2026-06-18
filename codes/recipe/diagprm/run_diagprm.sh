@@ -8,7 +8,7 @@
 #
 # 环境变量（可覆盖）：
 #   ACTOR_LOAD   : 模型路径（必填）
-#   KG_PATH      : master_kg.json 路径（必填）
+#   KG_PATH      : clean_master_kg.json 路径（默认使用 clean_v2，可覆盖）
 #   NNODES       : 节点数（default: 1）
 #   N_GPUS       : 每节点 GPU 数（default: 8）
 # ============================================================================
@@ -65,8 +65,8 @@ if [ -z "${VERL_LOCATION}" ] || [[ "${VERL_LOCATION}" != "${CODES_DIR}"* ]]; the
 fi
 
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
-# 训练集：由 prepare_mediq_data.py 生成的 parquet 文件
-DIAGPRM_DATASET="${DIAGPRM_DATASET:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset}"
+# 训练集：默认使用 clean_v2，可通过同名环境变量覆盖
+export DIAGPRM_DATASET="${DIAGPRM_DATASET:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/clean_v2}"
 TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
 VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
@@ -90,9 +90,8 @@ export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B}
 # export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-4B}"
 # export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B}"
 
-# ── KG 路径（必填）──────────────────────────────────────────────────────────
-# master_kg.json 的绝对路径
-export KG_PATH="${KG_PATH:-/home/ubuntu/liutianshuo/diagprm/diagprm_dataset/master_kg.json}"
+# ── KG 路径（默认 clean_v2，可覆盖）──────────────────────────────────────────
+export KG_PATH="${KG_PATH:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/clean_v2/clean_master_kg.json}"
 
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
