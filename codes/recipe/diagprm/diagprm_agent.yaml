@@ -7,6 +7,10 @@
   kg_tool_enabled: false
   # Patient simulator LLM API (OpenAI-compatible)
   # Can also be set via environment variables: PATIENT_API_BASE, PATIENT_MODEL, PATIENT_API_KEY
-  patient_api_base: "http://localhost:8001/v1"
-  patient_model: "gpt-4o-mini"
+  # 内部 API：https://aigc.sankuai.com/v1/openai/native
+  # API Key 通过环境变量 PATIENT_API_KEY 传入，避免硬编码
+  patient_api_base: "https://aigc.sankuai.com/v1/openai/native"
+  patient_model: "qwen3.5-plus"
   patient_max_tokens: 256
+  # 关闭思考模式：patient agent 不需要 CoT，节省 token 和延迟
+  patient_enable_thinking: false

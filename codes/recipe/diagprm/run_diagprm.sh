@@ -100,6 +100,14 @@ export ACTOR_LOAD="${ACTOR_LOAD:-${DIAGPRM_ROOT}/../base_model/Qwen3-1.7B}"
 # ── KG 路径（默认 clean_v2，可覆盖）──────────────────────────────────────────
 export KG_PATH="${KG_PATH:-${DIAGPRM_ROOT}/diagprm_dataset/clean_v2/clean_master_kg.json}"
 
+# ── Patient Agent API Key（内部 aigc.sankuai.com 接口鉴权）──────────────────
+# 必须通过环境变量传入，避免硬编码到脚本中：
+  export PATIENT_API_KEY="21998339899070533708"
+if [ -z "${PATIENT_API_KEY}" ]; then
+    echo "[WARN] PATIENT_API_KEY is not set. Patient API calls will fail without auth."
+    echo "[WARN] Run: export PATIENT_API_KEY=<your_token>  before starting training."
+fi
+
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
 export N_GPUS="${N_GPUS:-4}"

@@ -88,6 +88,8 @@ class DiagPRMAgentLoop(AgentLoopBase):
             os.environ.get("PATIENT_MODEL", "gpt-4o-mini"),
         )
         self.patient_max_tokens = kwargs.get("patient_max_tokens", 256)
+        # 是否开启思考模式（内部模型如 qwen3.5-plus 支持 enable_thinking 关闭，节省 token）
+        self.patient_enable_thinking = bool(kwargs.get("patient_enable_thinking", False))
         self.kg_tool_enabled = bool(kwargs.get("kg_tool_enabled", False))
         self.doctor_system_prompt = (
             DOCTOR_SYSTEM_PROMPT if self.kg_tool_enabled else DOCTOR_SYSTEM_PROMPT_NO_KG
@@ -536,7 +538,12 @@ class DiagPRMAgentLoop(AgentLoopBase):
             ],
             "max_tokens": self.patient_max_tokens,
             "temperature": 0.0,
+            "stream": False,
         }
+        # qwen3.5-plus 等内部思考模型默认会输出大量 reasoning_content，
+        # patient agent 不需要 CoT，显式关闭以节省 token 和延迟
+        if not self.patient_enable_thinking:
+            payload["enable_thinking"] = False
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get("PATIENT_API_KEY", "")
         if api_key:
@@ -680,7 +687,10 @@ class DiagPRMAgentLoop(AgentLoopBase):
             ],
             "max_tokens": 128,
             "temperature": 0.7,
+            "stream": False,
         }
+        if not self.patient_enable_thinking:
+            payload["enable_thinking"] = False
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get("PATIENT_API_KEY", "")
         if api_key:
