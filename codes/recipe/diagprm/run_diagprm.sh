@@ -35,10 +35,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 # vllm 0.9.x 的 AsyncvLLMServer 使用 V1 引擎（vllm.v1.engine）
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 
-# ── vLLM 缓存目录（避免 /home/ubuntu/.cache 权限问题）─────────────────────────
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/home/ubuntu/liutianshuo/.cache/vllm}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/home/ubuntu/liutianshuo/.cache}"
-mkdir -p "${VLLM_CACHE_ROOT}"
+
 
 # ── CUDA 库路径（vllm 需要 libcudart）──────────────────────────────────────────
 _CONDA_SITE_PKG="$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
@@ -50,8 +47,18 @@ fi
 # 本脚本位于 codes/recipe/diagprm/run_diagprm.sh
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODES_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DIAGPRM_ROOT="$(cd "${CODES_DIR}/.." && pwd)"  # diagprm/ 根目录
 export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
 cd "${CODES_DIR}"
+
+
+# ── vLLM 缓存目录（避免写入无权限目录）───────────────────────────────────────
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${DIAGPRM_ROOT}/.cache/vllm}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DIAGPRM_ROOT}/.cache}"
+mkdir -p "${VLLM_CACHE_ROOT}"
+
+
+
 
 # ── 确保使用本地 verl 源码（而非 pip 安装的旧版）────────────────────────────────
 # pip install -e 会把旧的 site-packages 指针替换为本地路径，
@@ -66,7 +73,7 @@ fi
 
 # ── 数据路径 ──────────────────────────────────────────────────────────────────
 # 训练集：默认使用 clean_v2，可通过同名环境变量覆盖
-export DIAGPRM_DATASET="${DIAGPRM_DATASET:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/clean_v2}"
+export DIAGPRM_DATASET="${DIAGPRM_DATASET:-${DIAGPRM_ROOT}/diagprm_dataset/clean_v2}"
 TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
 VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
@@ -86,12 +93,12 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
-export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-1.7B}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-4B}"
-# export ACTOR_LOAD="${ACTOR_LOAD:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B}"
+export ACTOR_LOAD="${ACTOR_LOAD:-${DIAGPRM_ROOT}/../base_model/Qwen3-1.7B}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-${DIAGPRM_ROOT}/../base_model/Qwen3-4B}"
+# export ACTOR_LOAD="${ACTOR_LOAD:-${DIAGPRM_ROOT}/../base_model/Qwen3-8B}"
 
 # ── KG 路径（默认 clean_v2，可覆盖）──────────────────────────────────────────
-export KG_PATH="${KG_PATH:-/Users/liuhaoyu/iclr_2027/diagprm/diagprm_dataset/clean_v2/clean_master_kg.json}"
+export KG_PATH="${KG_PATH:-${DIAGPRM_ROOT}/diagprm_dataset/clean_v2/clean_master_kg.json}"
 
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
