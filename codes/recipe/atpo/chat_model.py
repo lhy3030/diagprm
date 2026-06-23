@@ -94,6 +94,21 @@ class ChatModel(BaseChatModel):
     ) -> ChatResult:
         raise NotImplementedError
 
+    def _apply_chat_template(self, messages: list[dict], *, add_generation_prompt: bool = True) -> list[int]:
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+            )
+
     async def _agenerate(
         self,
         messages: list[BaseMessage],
@@ -163,11 +178,7 @@ class ChatModel(BaseChatModel):
         if messages[-1].type == "human" and len(messages) == 2:
             prompt_ids = await loop.run_in_executor(
                     None,
-                    lambda: self.tokenizer.apply_chat_template(
-                        convert_to_openai_messages(messages),
-                        add_generation_prompt=True,
-                        tokenize=True,
-                    ),
+                    lambda: self._apply_chat_template(convert_to_openai_messages(messages)),
                 )
             return str(uuid.uuid4()), prompt_ids, []
 
@@ -185,9 +196,7 @@ class ChatModel(BaseChatModel):
         human_responses = convert_to_openai_messages(messages[i + 1 :])
         human_response_ids = await loop.run_in_executor(
             None,
-            lambda messages=human_responses: self.tokenizer.encode('\n') + self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True
-            ),
+            lambda messages=human_responses: self.tokenizer.encode('\n') + self._apply_chat_template(messages),
         )
 
         # stop generation if response length exceeds max response length
@@ -335,4 +344,3 @@ def convert_to_agent_output(node: 'TreeNode', response_length: int) -> AgentLoop
         statistics=statistics
     )
     return output
-

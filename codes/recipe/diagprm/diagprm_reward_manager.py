@@ -146,14 +146,11 @@ class DiagPRMRewardManager(AbstractRewardManager):
 
             # ── 优先从 statistics.dialogue_history 读取对话轨迹（方案A）──────────
             # statistics 由 DiagPRMAgentLoop 写入，包含每轮的 doctor_response / patient_fact
-            statistics = data_item.non_tensor_batch.get("statistics", {})
-            if isinstance(statistics, dict):
-                pass
-            else:
-                try:
-                    statistics = dict(statistics) if statistics is not None else {}
-                except Exception:
-                    statistics = {}
+            statistics = data_item.non_tensor_batch.get(
+                "statistics",
+                data_item.non_tensor_batch.get("diagprm_statistics", {}),
+            )
+            statistics = self._as_plain_dict(statistics)
 
             dialogue_history = statistics.get("dialogue_history", None)
             fact_id_to_text = statistics.get("fact_id_to_text", {}) if isinstance(statistics, dict) else {}
@@ -229,14 +226,37 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 )
 
             if not turns_info:
-                reward_extra_info["turn_count"].append(0)
-                reward_extra_info["process_rewards_sum"].append(0.0)
-                reward_extra_info["outcome_reward"].append(0.0)
+                # turns_info 为空意味着 response_mask 中没有 mask=1 的 token span。
+                # 若方案A已通过 dialogue_history 计算出了 rewards / details，
+                # 则保留这些结果并把聚合 reward 写到最后一个有效 response 位置；
+                # 否则（方案B fallback 且真正空序列）才全部清零。
+                # dialogue_history 存在说明已走方案A，details_list / total_rewards 已被赋值
+                _has_history_rewards = bool(dialogue_history)
+                _final_r_diag = r_diag_list[-1] if (_has_history_rewards and r_diag_list) else 0.0
+                _total_rew = total_rewards if _has_history_rewards else []
+                _details = details_list if _has_history_rewards else []
+                _aggregate_reward = sum(_total_rew) if _total_rew else 0.0
+
+                # 兜底：无法定位逐轮 token span 时，只能把整条轨迹 reward 聚合到最后一个
+                # response token。adv_compute_info 也保持单位置/单 reward，避免长度不一致。
+                _mask_list = response_mask.tolist() if hasattr(response_mask, 'tolist') else list(response_mask)
+                _last_pos = -1
+                for _idx, _mask_val in enumerate(_mask_list):
+                    if _mask_val == 1:
+                        _last_pos = _idx
+                if _has_history_rewards and _last_pos >= 0:
+                    process_reward_tensor[i, _last_pos] = float(_aggregate_reward)
+                    outcome_reward_tensor[i, _last_pos] = float(_final_r_diag)
+
+                reward_extra_info["turn_count"].append(len(_details) if _details else 0)
+                reward_extra_info["process_rewards_sum"].append(_aggregate_reward)
+                reward_extra_info["outcome_reward"].append(_final_r_diag)
+                _turn_hypotheses = [d.get("curr_hypothesis", "") or "" for d in _details] if _details else []
                 reward_extra_info["adv_compute_info"].append({
-                    "turn_end_positions": [],
-                    "turn_process_rewards": [],
-                    "outcome_reward": 0.0,
-                    "turn_hypotheses": [],
+                    "turn_end_positions": [_last_pos] if (_has_history_rewards and _last_pos >= 0) else [],
+                    "turn_process_rewards": [_aggregate_reward] if (_has_history_rewards and _last_pos >= 0) else [],
+                    "outcome_reward": _final_r_diag,
+                    "turn_hypotheses": [_turn_hypotheses[-1]] if (_turn_hypotheses and _last_pos >= 0) else [],
                 })
                 reward_extra_info["diagprm_trajectory"].append(
                     self._build_diagprm_trajectory(
@@ -244,9 +264,9 @@ class DiagPRMRewardManager(AbstractRewardManager):
                         initial_symptoms=initial_symptoms,
                         dialogue_history=dialogue_history or [],
                         fact_id_to_text=fact_id_to_text,
-                        details_list=[],
-                        total_rewards=[],
-                        final_r_diag=0.0,
+                        details_list=_details,
+                        total_rewards=_total_rew,
+                        final_r_diag=_final_r_diag,
                     )
                 )
                 continue
@@ -346,6 +366,22 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 "length": 1,
             })
         return turns
+
+    def _as_plain_dict(self, value) -> dict:
+        """Convert numpy object wrappers / mapping-like values to a plain dict."""
+        if isinstance(value, dict):
+            return value
+        if hasattr(value, "item"):
+            try:
+                item = value.item()
+                if isinstance(item, dict):
+                    return item
+            except Exception:
+                pass
+        try:
+            return dict(value) if value is not None else {}
+        except Exception:
+            return {}
 
     def _build_diagprm_trajectory(
         self,

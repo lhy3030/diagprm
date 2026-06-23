@@ -34,6 +34,14 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 # ── vLLM 版本兼容性设置 ────────────────────────────────────────────────────────
 # vllm 0.9.x 的 AsyncvLLMServer 使用 V1 引擎（vllm.v1.engine）
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+# 阻止 Ray 修改 CUDA_VISIBLE_DEVICES：AsyncvLLMServer 是 @ray.remote(num_cpus=1)
+# 不请求 GPU 资源，Ray 会将其 CUDA_VISIBLE_DEVICES 清空，
+# 导致 vLLM V1 引擎 spawn 的子进程无法访问 GPU
+export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+
+# ── vLLM 调试日志 ──────────────────────────────────────────────────────────────
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
+export VLLM_TRACE_FUNCTION="${VLLM_TRACE_FUNCTION:-0}"
 
 
 
@@ -52,10 +60,27 @@ export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
 cd "${CODES_DIR}"
 
 
-# ── vLLM 缓存目录（避免写入无权限目录）───────────────────────────────────────
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${DIAGPRM_ROOT}/.cache/vllm}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DIAGPRM_ROOT}/.cache}"
-mkdir -p "${VLLM_CACHE_ROOT}"
+# ── 缓存目录（避免 home 磁盘配额不足，同时兼容非 ParaCloud 机器）───────────────
+# 若 /data/run01/$USER 可写，则优先使用高速运行盘；否则退回到 repo 内 .cache。
+_RUN_CACHE_BASE="/data/run01/${USER:-$(whoami 2>/dev/null || echo user)}"
+if [ -d "${_RUN_CACHE_BASE}" ] || mkdir -p "${_RUN_CACHE_BASE}" 2>/dev/null; then
+    _DEFAULT_CACHE_BASE="${_RUN_CACHE_BASE}/.cache"
+    _DEFAULT_CONFIG_HOME="${_RUN_CACHE_BASE}/.config"
+    _DEFAULT_TRITON_CACHE="${_RUN_CACHE_BASE}/.triton"
+else
+    _DEFAULT_CACHE_BASE="${DIAGPRM_ROOT}/.cache"
+    _DEFAULT_CONFIG_HOME="${DIAGPRM_ROOT}/.config"
+    _DEFAULT_TRITON_CACHE="${DIAGPRM_ROOT}/.triton"
+fi
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${_DEFAULT_TRITON_CACHE}}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_DEFAULT_CACHE_BASE}}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_DEFAULT_CONFIG_HOME}}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${XDG_CACHE_HOME}/vllm}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+mkdir -p "${TRITON_CACHE_DIR}" "${VLLM_CACHE_ROOT}" "${HF_HOME}" "${XDG_CONFIG_HOME}"
 
 
 
@@ -86,10 +111,7 @@ export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm/${_RUN_TIMESTAMP}}"
 echo "[INFO] Run timestamp: ${_RUN_TIMESTAMP}"
 echo "[INFO] Output dir:    ${OUTPUT_DIR}"
 
-# HuggingFace / datasets 缓存目录（避免写入无权限的 /home/ubuntu/.cache）
-export HF_HOME="${HF_HOME:-${CODES_DIR}/.cache/huggingface}"
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+# HF 缓存已在上方统一设置（/data/run01），此处不再覆盖
 
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
@@ -102,29 +124,51 @@ export KG_PATH="${KG_PATH:-${DIAGPRM_ROOT}/diagprm_dataset/clean_v2/clean_master
 
 # ── Patient Agent API Key（内部 aigc.sankuai.com 接口鉴权）──────────────────
 # 必须通过环境变量传入，避免硬编码到脚本中：
-  export PATIENT_API_KEY="21998339899070533708"
+export PATIENT_API_KEY="${PATIENT_API_KEY:-}"
 if [ -z "${PATIENT_API_KEY}" ]; then
     echo "[WARN] PATIENT_API_KEY is not set. Patient API calls will fail without auth."
     echo "[WARN] Run: export PATIENT_API_KEY=<your_token>  before starting training."
 fi
 
+# ── HTTP 代理（用于访问美团内网 aigc.sankuai.com）─────────────────────────────
+# PATIENT_PROXY 专门用于 Patient API（aigc.sankuai.com），与 https_proxy 解耦。
+# 代码层面（diagprm_agent_loop.py）直接读取 PATIENT_PROXY 环境变量作为代理，
+# 不再覆盖全局 https_proxy，避免影响其他网络请求（如 HF 下载）。
+#
+# 选项 A（默认）：使用 job_diagprm.sh 已设置的外网代理转发美团内网请求
+#   PATIENT_PROXY 留空 → aiohttp 会走 https_proxy (即外网代理)
+# 选项 B：使用 SSH 反向隧道（需在计算节点上建立隧道 → localhost:28888）
+#   export PATIENT_PROXY=http://127.0.0.1:28888
+#
+# 当前配置：不设置 PATIENT_PROXY，让 aiohttp 自动使用已有的 https_proxy 即可
+export PATIENT_PROXY="${PATIENT_PROXY:-}"
+if [ -n "${PATIENT_PROXY}" ]; then
+    echo "[INFO] Using PATIENT_PROXY for Patient API: ${PATIENT_PROXY}"
+else
+    echo "[INFO] PATIENT_PROXY not set, Patient API will use https_proxy: ${https_proxy:-not set}"
+fi
+
 # ── 资源配置 ──────────────────────────────────────────────────────────────────
 export NNODES="${NNODES:-1}"
-export N_GPUS="${N_GPUS:-4}"
+export N_GPUS="${N_GPUS:-8}"
 export NODE_RANK="${NODE_RANK:-0}"
 
-# ── 4 卡自动适配 ──────────────────────────────────────────────────────────────
-# 当 N_GPUS=4 时，自动缩减 batch size / mini batch / agent workers
-if [ "${N_GPUS}" -le 4 ]; then
-    # G=4 doubles rollout count compared with the old G=2 setting, so keep
-    # the number of prompts per update conservative on 4-GPU runs.
-    : "${TRAIN_BATCH_SIZE_OVERRIDE:=16}"
-    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=16}"
+# ── GPU 数量自动适配 ────────────────────────────────────────────────────────
+# infer_tp (tensor model parallel size) 必须能整除 GPU 数量
+# 1 GPU: infer_tp=1; 2+ GPU: infer_tp=2; 8+ GPU: infer_tp=4
+if [ "${N_GPUS}" -le 1 ]; then
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=4}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=4}"
+    : "${AGENT_NUM_WORKERS_OVERRIDE:=2}"
+    : "${INFER_TP_OVERRIDE:=1}"
+elif [ "${N_GPUS}" -le 4 ]; then
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=8}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=8}"
     : "${AGENT_NUM_WORKERS_OVERRIDE:=4}"
     : "${INFER_TP_OVERRIDE:=2}"
 else
-    : "${TRAIN_BATCH_SIZE_OVERRIDE:=32}"
-    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=32}"
+    : "${TRAIN_BATCH_SIZE_OVERRIDE:=16}"
+    : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=16}"
     : "${AGENT_NUM_WORKERS_OVERRIDE:=8}"
     : "${INFER_TP_OVERRIDE:=2}"
 fi
@@ -141,7 +185,7 @@ clip_ratio_high=0.28
 # ── 对话超参 ──────────────────────────────────────────────────────────────────
 max_turns=10           # 最大问诊轮数
 max_prompt_length=1024
-max_response_length=4096  # 增大：p90 约需 2500 tokens，2048 导致大量截断
+max_response_length=4096  # 单轮 response 上限；多轮对话每轮约 300-600 token，4096 避免截断
 actor_lr=1e-6
 
 # ── 批量大小 ──────────────────────────────────────────────────────────────────
@@ -149,15 +193,18 @@ train_batch_size=${TRAIN_BATCH_SIZE_OVERRIDE}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE_OVERRIDE}
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_resp_per_prompt=${N_RESP_PER_PROMPT_OVERRIDE:-8}  # GRPO group size G；可设为 8 做主实验大组对比
+n_resp_per_prompt=${N_RESP_PER_PROMPT_OVERRIDE:-8}  # GRPO group size G；8卡用 8，可通过 N_RESP_PER_PROMPT_OVERRIDE 覆盖
 n_resp_per_prompt_val=1
 
 # ── 性能配置 ──────────────────────────────────────────────────────────────────
 infer_tp=${INFER_TP_OVERRIDE}
 train_sp=1
 offload=True
+# actor_max_token_len_per_gpu：控制 actor update 时单卡最长 token 数
+# = (prompt + response) * G，8卡G=8: (1024+4096)*8 = 40960（开启 offload 可承受）
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * n_resp_per_prompt ))
-log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 2 ))
+# log_prob 只需 forward pass，显存更小，保持 1x 即可
+log_prob_max_token_len_per_gpu=${actor_max_token_len_per_gpu}
 
 # ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
 # 奖励结构：r(k) = turn_coef * r_turn(k) + r_diag(k)
@@ -236,7 +283,7 @@ python3 -m recipe.diagprm.diagprm_main \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -282,4 +329,6 @@ python3 -m recipe.diagprm.diagprm_main \
     trainer.default_local_dir=${SAVE_CHECKPOINT_DIR} \
     trainer.rollout_data_dir=${OUTPUT_DIR}/rollout_data \
     trainer.validation_data_dir=${OUTPUT_DIR}/validation_data \
+    ${RESUME_MODE:+trainer.resume_mode=${RESUME_MODE}} \
+    ${RESUME_PATH:+trainer.resume_from_path=${RESUME_PATH}} \
     "$@"

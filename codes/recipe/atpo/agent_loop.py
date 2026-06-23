@@ -915,6 +915,16 @@ class AgentLoopManager:
 
         # udpate statistics
         statistics = output.non_tensor_batch.pop('statistics')
+        # DiagPRM needs hidden dialogue_history / fact_id_to_text in the reward
+        # manager. The generic ATPO statistics path consumes this field for
+        # logging, so preserve only DiagPRM-style statistics under a dedicated key.
+        if any(
+            isinstance(x, dict) and (
+                "dialogue_history" in x or "fact_id_to_text" in x
+            )
+            for x in statistics
+        ):
+            output.non_tensor_batch["diagprm_statistics"] = statistics
         statistics_metric = self._update_statistics(statistics)
 
         # calculate performance metrics

@@ -79,13 +79,15 @@ class DiagPRMAgentLoop(AgentLoopBase):
         self.max_turns = kwargs.get("max_turns", 10)
         self.verifier_enabled = kwargs.get("verifier_enabled", True)
         # Patient LLM API config
-        self.patient_api_base = kwargs.get(
-            "patient_api_base",
-            os.environ.get("PATIENT_API_BASE", "http://localhost:8001/v1"),
+        # 优先级：环境变量 > yaml/kwargs > 默认值
+        # 环境变量允许在运行时动态切换（如本地 vLLM 替换外网 API），无需修改 yaml
+        self.patient_api_base = (
+            os.environ.get("PATIENT_API_BASE")
+            or kwargs.get("patient_api_base", "http://localhost:8001/v1")
         )
-        self.patient_model = kwargs.get(
-            "patient_model",
-            os.environ.get("PATIENT_MODEL", "gpt-4o-mini"),
+        self.patient_model = (
+            os.environ.get("PATIENT_MODEL")
+            or kwargs.get("patient_model", "gpt-4o-mini")
         )
         self.patient_max_tokens = kwargs.get("patient_max_tokens", 256)
         # 是否开启思考模式（内部模型如 qwen3.5-plus 支持 enable_thinking 关闭，节省 token）
@@ -540,16 +542,22 @@ class DiagPRMAgentLoop(AgentLoopBase):
             "temperature": 0.0,
             "stream": False,
         }
-        # qwen3.5-plus 等内部思考模型默认会输出大量 reasoning_content，
-        # patient agent 不需要 CoT，显式关闭以节省 token 和延迟
-        if not self.patient_enable_thinking:
+        # enable_thinking 是美团内部 API 特有字段（qwen3.5-plus 等思考模型）
+        # 本地 vLLM server 不支持此字段，只对外网 API 发送
+        _is_local = self.patient_api_base.startswith("http://127.0.0.1") or \
+                    self.patient_api_base.startswith("http://localhost")
+        if not self.patient_enable_thinking and not _is_local:
             payload["enable_thinking"] = False
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get("PATIENT_API_KEY", "")
-        if api_key:
+        if api_key and not _is_local:
             headers["Authorization"] = f"Bearer {api_key}"
 
         url = self.patient_api_base.rstrip("/") + "/chat/completions"
+        # 本地 vLLM 无需代理；外网 API 读取代理配置
+        _proxy = None if _is_local else (
+            os.environ.get("PATIENT_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+        )
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -557,6 +565,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
+                    proxy=_proxy,
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -689,14 +698,19 @@ class DiagPRMAgentLoop(AgentLoopBase):
             "temperature": 0.7,
             "stream": False,
         }
-        if not self.patient_enable_thinking:
+        _is_local = self.patient_api_base.startswith("http://127.0.0.1") or \
+                    self.patient_api_base.startswith("http://localhost")
+        if not self.patient_enable_thinking and not _is_local:
             payload["enable_thinking"] = False
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get("PATIENT_API_KEY", "")
-        if api_key:
+        if api_key and not _is_local:
             headers["Authorization"] = f"Bearer {api_key}"
 
         url = self.patient_api_base.rstrip("/") + "/chat/completions"
+        _proxy = None if _is_local else (
+            os.environ.get("PATIENT_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+        )
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -704,6 +718,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
                     json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
+                    proxy=_proxy,
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()

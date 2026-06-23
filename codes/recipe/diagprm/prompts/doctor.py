@@ -58,7 +58,8 @@ When ready to diagnose:
 5. Only use `"action": "diagnose"` when you have sufficient evidence.
 6. Maximum allowed turns: {max_turns}. Current turn: {current_turn} / {max_turns}.
 7. On the final turn, you MUST use `"action": "diagnose"` with your best hypothesis.
-"""
+
+/no_think"""
 
 DOCTOR_SYSTEM_PROMPT = """You are an experienced diagnostic physician conducting a symptom-gathering dialogue. Your goal is to identify the disease through targeted questioning and then provide a confirmed diagnosis.
 

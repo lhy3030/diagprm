@@ -621,7 +621,8 @@ class RayPPOTrainer:
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, **kwargs):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        jsonl_filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        json_filename = os.path.join(dump_path, f"{self.global_steps}.json")
 
         n = len(inputs)
         base_data = {
@@ -649,16 +650,20 @@ class RayPPOTrainer:
                 print(f"Warning: Length mismatch for key '{key}': expected {n}, got {len(value)}")
                 base_data[key] = value
 
-        lines = []
+        entries = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
             entry = replace_nan(entry)
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            entries.append(entry)
 
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+        with open(jsonl_filename, "w") as f:
+            f.write("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n")
 
-        print(f"Dumped generations to {filename}")
+        with open(json_filename, "w") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        print(f"Dumped generations to {jsonl_filename} and {json_filename}")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
