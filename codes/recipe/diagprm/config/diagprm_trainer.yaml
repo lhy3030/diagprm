@@ -60,12 +60,11 @@ reward_model:
 # ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
 reward_coefficients:
   beta: 1.0         # KG 覆盖率差分系数
-  gamma1: 0.3       # 假设正确性系数
   turn_coef: 1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
-  lam: 0.5          # 切换修正系数
   r_max: 2.0        # 最大确诊奖励
   tau: 0.5          # 过早确诊 KG 覆盖率阈值
-  format_score: 0.1
+  min_new_facts_for_diagnosis: 2
+  r_premature_diag: 0.0
   weighted: true    # 是否使用加权 KG 覆盖率
 
 # ── Algorithm（Turn-level GRPO，无 Critic）────────────────────────────────────

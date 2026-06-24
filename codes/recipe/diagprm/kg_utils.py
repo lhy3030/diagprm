@@ -210,14 +210,12 @@ def _parse_json_from_output(model_output: str) -> dict:
 
 def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    从模型输出中解析 JSON 格式，提取：
-    - primary_hypothesis: hypothesis 字段（即当前假设）
-    - action: action 字段内容（continue / switch / diagnose）
+    从模型输出中解析 JSON 格式，提取可选诊断名和动作。
 
-    兼容旧 XML 格式（<hypothesis name="..."> / <action>...</action>）作为 fallback。
+    主方法不再要求 hypothesis 字段；旧 hypothesis/XML 格式只作为 fallback。
 
     Returns:
-        (primary_hypothesis_str | None, action_str | None)
+        (diagnosis_or_legacy_hypothesis | None, action_str | None)
     """
     # 优先尝试 JSON
     parsed = _parse_json_from_output(model_output)
@@ -229,8 +227,10 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
         if hyp:
             primary = _normalize(str(hyp))
         raw_action = parsed.get("action", "").strip().lower()
-        if raw_action in ("continue", "switch", "diagnose"):
-            action = "continue" if raw_action == "switch" else raw_action
+        if raw_action in ("ask", "continue", "switch"):
+            action = "ask"
+        elif raw_action == "diagnose":
+            action = "diagnose"
         return primary, action
 
     # Fallback: 旧 XML 格式
@@ -243,13 +243,13 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
         primary = _normalize(hyp_match.group(1))
 
     action_match = re.search(
-        r'<action>\s*(continue|switch|diagnose)\s*</action>',
+        r'<action>\s*(ask|continue|switch|diagnose)\s*</action>',
         model_output,
         re.IGNORECASE | re.DOTALL,
     )
     if action_match:
         raw_action = action_match.group(1).strip().lower()
-        action = "continue" if raw_action == "switch" else raw_action
+        action = "ask" if raw_action in ("ask", "continue", "switch") else raw_action
 
     return primary, action
 

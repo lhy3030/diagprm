@@ -5,20 +5,20 @@ DiagPRM - Turn-level GRPO Advantage Estimator（GiGPO 风格两层 Grouping）
 
   奖励结构：
     r(k) = turn_coef * r_turn(k) + r_diag
-    r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
+    r_turn(k) = Δ_k^kg
 
   两层归一化（GiGPO 风格）：
-    ① 假设感知 Group（Turn 级别）：
-       - 同一 uid（prompt）下，所有 rollout 中处于"相同假设"下的各轮 r_turn(k)，
-         归入同一 group，在组内做均值/方差归一化 → Â_turn(k)
-       - 直觉：在当前假设语境下，哪些问诊行为更有效？
+    ① Turn-position Group（Turn 级别）：
+       - 同一 uid（prompt）下，所有 rollout 中相同 turn 位置的 r_turn(k)，
+         归入同一 group，在组内做均值/方差归一化 -> A_turn(k)
+       - 直觉：在相同问诊阶段，哪些问题带来更多新增证据？
     ② 轨迹 Group（Episode 级别）：
        - 同一 uid（prompt）下，所有 rollout 的最终 r_diag，
          跨 rollout 做均值/方差归一化 → Â_diag
        - 直觉：哪条完整轨迹诊断结果更好？
 
   GiGPO 风格混合：
-    Â(k) = Â_turn(k) + α * Â_diag
+    A(k) = A_turn(k) + alpha * A_diag
     - 每一轮的最终 advantage 是 turn 级信号 + 轨迹级信号的加权和
     - α 默认 0.5，可通过 alpha 参数调节
 
@@ -32,7 +32,6 @@ adv_compute_info 格式（由 DiagPRMRewardManager 生成）：
     "turn_end_positions": List[int],
     "turn_process_rewards": List[float],   # r(k) = turn_coef*r_turn + r_diag（已合并）
     "outcome_reward": float,               # 最终轮 r_diag
-    "turn_hypotheses": List[str],          # 可选：每轮的 primary hypothesis（规范化）
   }
 """
 
@@ -69,7 +68,6 @@ def compute_diagprm_turn_advantage(
               "turn_end_positions": List[int],
               "turn_process_rewards": List[float],  # 已含 turn_coef*r_turn + r_diag
               "outcome_reward": float,
-              "turn_hypotheses": List[str],          # 可选，每轮 primary hypothesis
             }
             如果为 None，退化为标准 outcome-only GRPO。
         alpha: GiGPO 混合系数，控制轨迹级信号 Â_diag 的权重。
@@ -104,7 +102,7 @@ def compute_diagprm_turn_advantage(
             turn_end_positions = info.get("turn_end_positions", [])
             turn_process_rewards = info.get("turn_process_rewards", [])
             outcome_reward = info.get("outcome_reward", 0.0)
-            # 每轮的 primary hypothesis（可选，用于假设感知分组）
+            # 旧 hypothesis 分组字段。主方法不传该字段，因此按 turn index 分组。
             turn_hypotheses = info.get("turn_hypotheses", None)
 
             # 从 turn_process_rewards 中分离 r_turn 和 r_diag：
@@ -125,9 +123,10 @@ def compute_diagprm_turn_advantage(
             ))
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 2：层① — 假设感知 Group（turn 级）归一化 → Â_turn
+        # Step 2：层① — Turn-position Group（turn 级）归一化 → A_turn
         # ══════════════════════════════════════════════════════════════════════
-        # 同一 uid + 同一 hypothesis（或同一 turn 位置）的 r_turn 归入一个 group
+        # 同一 uid + 同一 turn 位置的 r_turn 归入一个 group。
+        # 若旧 ablation 传入 turn_hypotheses，则仍兼容按 hypothesis 分组。
         # 结果：adv_turn_map[(sample_idx, turn_idx)] = normalized_adv_turn
 
         adv_turn_map: dict = {}  # (sample_idx, turn_idx) → float
@@ -147,8 +146,8 @@ def compute_diagprm_turn_advantage(
                         )
                 continue
 
-            # 收集每个 turn 位置的 r_turn，按 hypothesis 做分组 key
-            # 分组 key：(uid, hypothesis_name) 如果有 hypothesis 信息，否则用 (uid, turn_idx)
+            # 收集每个 turn 位置的 r_turn。
+            # 主方法分组 key：(uid, turn_idx)；旧 hypothesis ablation 可传入 hypothesis 信息。
             # 结构：group_key → [(sample_idx, turn_idx, r_turn_val)]
             hyp_group: dict = defaultdict(list)
 

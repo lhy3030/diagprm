@@ -2,11 +2,10 @@
 DiagPRM - Turn-level Reward Function
 
 每一轮的 reward 由以下分量组成：
-  r(k) = Δ_k^kg  +  r_hyp(k)  +  r_diag（仅确诊轮）
+  r(k) = turn_coef * Δ_k^kg + r_diag（仅确诊轮）
 
 各分量含义：
   Δ_k^kg   : KG 覆盖率差分（dense，每轮都有）
-  r_hyp(k) : 假设正确性奖励（每轮，感知主假设是否与 GT 一致）
   r_diag   : 确诊奖励（仅 <action>diagnose</action> 时触发）
 
 全部奖励来源于 KG 静态查询 + ground truth label，无需任何模型前向传播。
@@ -115,22 +114,19 @@ def calculate_turn_reward(
     human_response: str,              # 患者对本轮问题的回答（用于更新症状集合）
     prev_collected_symptoms: Set[str],
     curr_collected_symptoms: Set[str],
-    prev_hypothesis: Optional[str],   # 上一轮 primary hypothesis（规范化）
-    curr_hypothesis: Optional[str],   # 本轮 primary hypothesis（规范化）
-    action: Optional[str],            # continue / diagnose
+    action: Optional[str],            # ask / diagnose
     ground_truth_disease: str,        # 规范化的 GT 疾病名
     kg: Dict,
     is_final_turn: bool,
+    n_initial_symptoms: int = 0,
     # ---------- 奖励系数 ----------
     beta: float = 1.0,        # KG 覆盖率差分系数
-    gamma1: float = 0.3,      # 假设正确性奖励系数
     turn_coef: float = 1.0,   # Turn 奖励总系数（r_turn 乘以该系数后加 r_diag）
     r_max: float = 2.0,       # 最大确诊奖励
     tau: float = 0.5,         # 最低 KG 覆盖率阈值（过早确诊惩罚）
-    format_score: float = 0.1,
     weighted: bool = True,
-    evidence_gated_hyp: bool = True,
-    wrong_hyp_penalty_scale: float = 0.5,
+    min_new_facts_for_diagnosis: int = 2,
+    r_premature_diag: float = 0.0,
     r_wrong_diag: float = -1.0,
     r_timeout: float = -1.0,
 ) -> Dict:
@@ -141,57 +137,54 @@ def calculate_turn_reward(
         r(k) = turn_coef * r_turn(k) + r_diag(k)
 
     其中：
-        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
-          - format_reward : 输出格式正确奖励（含 <think> 且有合法 action）
+        r_turn(k) = Δ_k^kg
           - Δ_k^kg        : KG 覆盖率差分（本轮症状收集的增量贡献）
-          - r_hyp(k)      : 主假设是否指向 GT（每轮都有，假设更新隐含在 continue 中）
 
         r_diag(k) : 确诊奖励（仅 is_final_turn 时非零）
-          - 正确诊断且覆盖率充分 : +r_max
-          - 正确诊断但覆盖率不足 : +r_max * 0.5（过早确诊）
+          - 正确诊断且证据充分 : +r_max
+          - 正确诊断但证据不足 : r_premature_diag
           - 诊断错误              : r_wrong_diag
           - 超时未确诊            : r_timeout
 
     Returns:
         dict with keys:
           total_reward, r_turn, r_diag,
-          format_reward, delta_kg, r_hyp,
+          delta_kg,
           details
     """
     gt_norm = _normalize(ground_truth_disease)
     details = {
         "action": action,
-        "curr_hypothesis": curr_hypothesis,
-        "prev_hypothesis": prev_hypothesis,
         "gt_disease": gt_norm,
         "has_valid_format": False,
         "format_reward": 0.0,
         "delta_kg": 0.0,
-        "r_hyp": 0.0,
         "r_turn": 0.0,
         "r_diag": 0.0,
         "coverage_before": 0.0,
         "coverage_after": 0.0,
         "n_symptoms_collected": len(curr_collected_symptoms),
+        "n_new_symptoms_collected": max(len(curr_collected_symptoms) - n_initial_symptoms, 0),
         "is_correct_diagnosis": False,
         "premature_diagnosis": False,
     }
 
     # ── 1. 格式检查 ──────────────────────────────────────────────────────────
-    # 检查是否包含合法 JSON（有 thought/hypothesis/action 字段）
+    # 只作为 diagnostics 记录，不进入 reward；格式能力主要交给 SFT 学。
     from recipe.diagprm.kg_utils import _parse_json_from_output
     parsed_json = _parse_json_from_output(model_response)
     json_valid = bool(
         parsed_json
-        and parsed_json.get("action") in ("continue", "diagnose", "switch")
-        and ("hypothesis" in parsed_json or "diagnosis" in parsed_json)
+        and parsed_json.get("action") in ("ask", "diagnose", "continue", "switch")
+        and (
+            (parsed_json.get("action") == "diagnose" and "diagnosis" in parsed_json)
+            or ("question" in parsed_json)
+        )
     )
     action_match = action is not None
     if json_valid and action_match:
         details["has_valid_format"] = True
-        format_reward = format_score
-    else:
-        format_reward = 0.0
+    format_reward = 0.0
     details["format_reward"] = format_reward
 
     # ── 2. KG 覆盖率差分 Δ_k^kg ─────────────────────────────────────────────
@@ -204,53 +197,38 @@ def calculate_turn_reward(
     details["coverage_after"] = cov_after
     details["delta_kg"] = delta_kg
 
-    # ── 3. 假设正确性奖励 r_hyp ──────────────────────────────────────────────
-    # 每轮均感知主假设是否为 GT，假设切换隐含在 continue 动作内的 hypothesis_state 更新中
-    r_hyp = 0.0
-    if curr_hypothesis is not None:
-        # 比较主假设与 GT（允许模糊包含匹配）
-        hyp_match = bool(gt_norm and (gt_norm in curr_hypothesis or curr_hypothesis in gt_norm))
-        if evidence_gated_hyp:
-            # 正确假设只有在本轮带来新增 GT evidence 时才奖励，避免早猜刷分。
-            if hyp_match and delta_kg > 0:
-                r_hyp = gamma1
-            elif (not hyp_match) and action == "continue":
-                r_hyp = -gamma1 * wrong_hyp_penalty_scale
-        else:
-            r_hyp = gamma1 if hyp_match else -gamma1
-    details["r_hyp"] = r_hyp
-
-    # ── 4. 合并 Turn 奖励 ────────────────────────────────────────────────────
-    # r_turn 封装了本轮问诊质量的全部即时信号（去掉 r_switch）
-    r_turn = format_reward + delta_kg + r_hyp
+    # ── 3. 合并 Turn 奖励 ────────────────────────────────────────────────────
+    # r_turn 只保留任务相关信号：新增证据。
+    # unknown / duplicate 问题自然对应 delta_kg=0，不额外惩罚。
+    r_turn = delta_kg
     details["r_turn"] = r_turn
 
-    # ── 5. 确诊奖励 r_diag（仅 is_final_turn 时） ────────────────────────────
-    # 注意：action 到达此处时已经过归一化，只有 "continue" / "diagnose" / None 三种值
-    # （旧的 "switch" 在 parse_hypothesis_state 中已转换为 "continue"）
+    # ── 4. 确诊奖励 r_diag（仅 is_final_turn 时） ────────────────────────────
+    # 注意：action 到达此处时已经过归一化，只有 "ask" / "diagnose" / None 三种值。
     r_diag = 0.0
     if is_final_turn:
         if action == "diagnose":
             predicted = parse_final_diagnosis(model_response)
             if predicted is not None and is_diagnosis_match(predicted, gt_norm, kg):
-                # 检查覆盖率是否足够（避免过早确诊奖励）
-                if cov_after >= tau:
+                n_new = max(len(curr_collected_symptoms) - n_initial_symptoms, 0)
+                evidence_ok = cov_after >= tau and n_new >= min_new_facts_for_diagnosis
+                if evidence_ok:
                     r_diag = r_max
                     details["is_correct_diagnosis"] = True
                 else:
-                    # 正确诊断但证据不足 → 减半奖励
-                    r_diag = r_max * 0.5
+                    # 正确诊断但证据不足：不鼓励根据初始主诉直接猜病。
+                    r_diag = r_premature_diag
                     details["is_correct_diagnosis"] = True
                     details["premature_diagnosis"] = True
             else:
                 # 错误诊断
                 r_diag = r_wrong_diag
         else:
-            # 达到最大轮次仍是 continue / None（未触发 diagnose）→ 超时惩罚
+            # 达到最大轮次仍是 ask / None（未触发 diagnose）→ 超时惩罚
             r_diag = r_timeout
     details["r_diag"] = r_diag
 
-    # ── 6. 最终合并：r(k) = turn_coef * r_turn + r_diag ─────────────────────
+    # ── 5. 最终合并：r(k) = turn_coef * r_turn + r_diag ─────────────────────
     total_reward = turn_coef * r_turn + r_diag
 
     return {
@@ -258,9 +236,8 @@ def calculate_turn_reward(
         "r_turn": float(r_turn),                  # 本轮即时信号合计
         "r_diag": float(r_diag),                  # 确诊奖励（非最终轮为 0）
         # 细项（供 metrics 展示）
-        "format_reward": float(format_reward),
+        "format_reward": 0.0,
         "delta_kg": float(delta_kg),
-        "r_hyp": float(r_hyp),
         # 兼容旧接口（process_reward / outcome_reward 字段保留）
         "process_reward": float(turn_coef * r_turn),
         "outcome_reward": float(r_diag),
@@ -336,7 +313,7 @@ def compute_episode_rewards_from_history(
 
     奖励结构（每轮）：
         r(k) = turn_coef * r_turn(k) + r_diag(k)
-        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
+        r_turn(k) = Δ_k^kg
     """
     from recipe.diagprm.kg_utils import _normalize, extract_symptoms_from_text
 
@@ -353,13 +330,18 @@ def compute_episode_rewards_from_history(
     details_list = []
     fact_id_to_text = fact_id_to_text or {}
 
-    prev_hypothesis: Optional[str] = None
     _params = {
         k: v for k, v in reward_params.items()
-        if k not in {"lam", "unknown_penalty", "duplicate_penalty"}
+        if k not in {
+            "lam",
+            "format_score",
+            "unknown_penalty",
+            "duplicate_penalty",
+            "gamma1",
+            "evidence_gated_hyp",
+            "wrong_hyp_penalty_scale",
+        }
     }
-    unknown_penalty = float(reward_params.get("unknown_penalty", -0.05))
-    duplicate_penalty = float(reward_params.get("duplicate_penalty", -0.05))
 
     for turn_idx, entry in enumerate(dialogue_history):
         doctor_response = entry.get("doctor_response", "")
@@ -376,8 +358,8 @@ def compute_episode_rewards_from_history(
             )
         is_final        = entry.get("is_final", turn_idx == len(dialogue_history) - 1)
 
-        # 解析本轮 action 和 hypothesis
-        curr_hypothesis, action = parse_hypothesis_state(doctor_response)
+        # 解析本轮 action；旧 hypothesis 字段只作为解析兼容，不参与主 reward。
+        _, action = parse_hypothesis_state(doctor_response)
 
         # Update symptom set from patient_fact.
         # patient_fact is now a KG verbatim symptom key (e.g. "chest pain").
@@ -406,28 +388,26 @@ def compute_episode_rewards_from_history(
             human_response=entry.get("patient_answer", ""),
             prev_collected_symptoms=prev_symptoms,
             curr_collected_symptoms=collected_symptoms,
-            prev_hypothesis=prev_hypothesis,
-            curr_hypothesis=curr_hypothesis,
             action=action,
             ground_truth_disease=gt_norm,
             kg=kg,
             is_final_turn=is_final,
+            n_initial_symptoms=len({
+                _normalize(sym)
+                for sym in initial_symptoms or []
+                if _normalize(sym) in disease_syms
+            }),
             **_params,
         )
 
-        if (not is_final) and is_unknown_fact:
-            turn_result["total_reward"] += unknown_penalty
-            turn_result["details"]["unknown_penalty"] = unknown_penalty
-        if (not is_final) and is_duplicate_fact:
-            turn_result["total_reward"] += duplicate_penalty
-            turn_result["details"]["duplicate_penalty"] = duplicate_penalty
+        turn_result["details"]["is_unknown_fact"] = bool((not is_final) and is_unknown_fact)
+        turn_result["details"]["is_duplicate_fact"] = bool((not is_final) and is_duplicate_fact)
         turn_result["details"]["patient_fact_id"] = patient_fact_id
         turn_result["details"]["patient_fact"] = patient_fact if patient_fact != "unknown" else ""
 
         total_rewards.append(turn_result["total_reward"])
         r_diag_list.append(turn_result["r_diag"])
         details_list.append(turn_result["details"])
-        prev_hypothesis = curr_hypothesis
 
     return total_rewards, r_diag_list, details_list
 
@@ -459,7 +439,7 @@ def compute_episode_rewards(
 
     奖励结构（每轮）：
         r(k) = turn_coef * r_turn(k) + r_diag(k)
-        r_turn(k) = format_reward + Δ_k^kg + r_hyp(k)
+        r_turn(k) = Δ_k^kg
 
     Returns:
         total_rewards : List[float]  每轮 r(k) = turn_coef * r_turn + r_diag
@@ -478,10 +458,6 @@ def compute_episode_rewards(
     r_diag_list = []
     details_list = []
 
-    prev_hypothesis: Optional[str] = None
-    unknown_penalty = float(reward_params.get("unknown_penalty", -0.05))
-    duplicate_penalty = float(reward_params.get("duplicate_penalty", -0.05))
-
     for turn_idx, turn_info in enumerate(turns_info):
         model_response = turn_info["response"]
         is_final = turn_info["is_final_turn"]
@@ -489,8 +465,8 @@ def compute_episode_rewards(
         # 获取患者回答（最后一轮通常没有患者回答）
         human_resp = human_responses[turn_idx] if turn_idx < len(human_responses) else ""
 
-        # 解析本轮的 action 和 hypothesis
-        curr_hypothesis, action = parse_hypothesis_state(model_response)
+        # 解析本轮 action；旧 hypothesis 字段只作为解析兼容，不参与主 reward。
+        _, action = parse_hypothesis_state(model_response)
         question = parse_question(model_response)
 
         # 更新症状集合：把患者回答里确认的症状加入 collected
@@ -508,34 +484,38 @@ def compute_episode_rewards(
         # 计算本轮 reward（过滤掉 lam 参数，因为已去掉 r_switch）
         _params = {
             k: v for k, v in reward_params.items()
-            if k not in {"lam", "unknown_penalty", "duplicate_penalty"}
+            if k not in {
+                "lam",
+                "format_score",
+                "unknown_penalty",
+                "duplicate_penalty",
+                "gamma1",
+                "evidence_gated_hyp",
+                "wrong_hyp_penalty_scale",
+            }
         }
         turn_result = calculate_turn_reward(
             model_response=model_response,
             human_response=human_resp,
             prev_collected_symptoms=prev_symptoms,
             curr_collected_symptoms=collected_symptoms,
-            prev_hypothesis=prev_hypothesis,
-            curr_hypothesis=curr_hypothesis,
             action=action,
             ground_truth_disease=gt_norm,
             kg=kg,
             is_final_turn=is_final,
+            n_initial_symptoms=len({
+                _normalize(sym)
+                for sym in initial_symptoms or []
+                if _normalize(sym) in disease_syms
+            }),
             **_params,
         )
 
-        if (not is_final) and is_unknown_fact:
-            turn_result["total_reward"] += unknown_penalty
-            turn_result["details"]["unknown_penalty"] = unknown_penalty
-        if (not is_final) and is_duplicate_fact:
-            turn_result["total_reward"] += duplicate_penalty
-            turn_result["details"]["duplicate_penalty"] = duplicate_penalty
+        turn_result["details"]["is_unknown_fact"] = bool((not is_final) and is_unknown_fact)
+        turn_result["details"]["is_duplicate_fact"] = bool((not is_final) and is_duplicate_fact)
 
         total_rewards.append(turn_result["total_reward"])
         r_diag_list.append(turn_result["r_diag"])
         details_list.append(turn_result["details"])
-
-        # 更新上一轮 hypothesis
-        prev_hypothesis = curr_hypothesis
 
     return total_rewards, r_diag_list, details_list

@@ -4,7 +4,7 @@ DiagPRM - Multi-turn Diagnostic Dialogue Agent Loop
 Implements the async multi-turn diagnostic dialogue between the Doctor Agent and Patient Simulator.
 
 Dialogue protocol (each turn):
-  Doctor  : JSON block with keys: thought, hypothesis, confirmed, action, question/diagnosis
+  Doctor  : JSON block with keys: action, question/diagnosis
   Patient : JSON block with keys: answer, fact_id
 
 Doctor Agent prompt format (full-history multi-turn mode):
@@ -13,7 +13,6 @@ Doctor Agent prompt format (full-history multi-turn mode):
   Next turn     : current prompt is the previous prompt + previous Doctor response + previous patient answer
 
 State tracking (Agent Loop side):
-  current_hypothesis   : parsed from JSON in previous Doctor output
   collected_symptoms   : accumulated confirmed symptoms from Patient answers
   new_finding          : new symptoms added this turn (or "No new findings" for invalid questions)
 
@@ -56,7 +55,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
     DiagPRM 多轮诊断对话 Agent Loop。
     
     继承自 ATPO 的 AgentLoopBase，重写对话逻辑以支持：
-      - Doctor Agent 的结构化 CoT 格式（<hypothesis name="...">, <action>）
+      - Doctor Agent 的干净 JSON 动作格式（ask / diagnose）
       - Patient Simulator（基于 hidden symptom facts 的规则 + LLM 混合问答）
       - Verifier（检测重复/多重问题）
       - 最大轮次控制
@@ -195,7 +194,6 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
         # 系统侧维护（仅用于 reward 计算，不影响 doctor prompt）
         collected_symptoms: List[str] = []   # 累积确认的症状（KG 匹配用）
-        current_hypothesis: str = ""         # 上一轮 Doctor 输出的假设名
         last_ai_msg = None                   # 保留最后一条 AIMessage（用于提取 token ids）
         dialogue_history: List[dict] = []    # 每轮 {turn_id, doctor_response, patient_answer, patient_fact_id}
 
@@ -250,11 +248,6 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
                 # ── 解析 action ────────────────────────────────────────────────
                 action = self._parse_action(doctor_response)
-
-                # ── 更新系统侧的当前假设（从本轮输出解析，供 reward 计算用）──
-                parsed_hyp, _ = self._parse_hypothesis_name(doctor_response)
-                if parsed_hyp:
-                    current_hypothesis = parsed_hyp
 
                 # ── 将 doctor 回复追加到对话历史 ─────────────────────────────
                 # 必须保留 ChatModel 写入的 response_metadata，后续轮次会基于
@@ -805,7 +798,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         return {}
 
     def _parse_hypothesis_name(self, doctor_response: str) -> Tuple[Optional[str], Optional[str]]:
-        """从 doctor 回复中解析假设名称和 action（JSON 格式）。
+        """Backward-compatible parser for old hypothesis-format outputs.
 
         Returns:
             (hypothesis_name | None, action | None)
@@ -815,7 +808,12 @@ class DiagPRMAgentLoop(AgentLoopBase):
         if hypothesis:
             hypothesis = str(hypothesis).strip()
         raw_action = parsed.get("action", "").strip().lower()
-        action = "continue" if raw_action == "switch" else (raw_action if raw_action in ("continue", "diagnose") else None)
+        if raw_action in ("ask", "continue", "switch"):
+            action = "ask"
+        elif raw_action == "diagnose":
+            action = "diagnose"
+        else:
+            action = None
         return hypothesis, action
 
     def _parse_patient_json(self, raw: str) -> Dict:
@@ -908,21 +906,23 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
     def _parse_action(self, doctor_response: str) -> Optional[str]:
         """从 doctor 回复中解析 action（JSON 格式）。
-        动作空间： continue / diagnose（将旧的 switch 平滑合并为 continue）
+        动作空间： ask / diagnose（将旧的 continue/switch 平滑合并为 ask）
         """
         parsed = self._parse_doctor_json(doctor_response)
         raw = parsed.get("action", "").strip().lower()
-        if raw in ("continue", "switch", "diagnose"):
-            return "continue" if raw == "switch" else raw
+        if raw in ("ask", "continue", "switch"):
+            return "ask"
+        if raw == "diagnose":
+            return "diagnose"
         # Fallback: legacy XML tag
         match = re.search(
-            r'<action>\s*(continue|switch|diagnose)\s*</action>',
+            r'<action>\s*(ask|continue|switch|diagnose)\s*</action>',
             doctor_response,
             re.IGNORECASE | re.DOTALL,
         )
         if match:
             raw2 = match.group(1).strip().lower()
-            return "continue" if raw2 == "switch" else raw2
+            return "ask" if raw2 in ("ask", "continue", "switch") else raw2
         return None
 
     def _parse_question(self, doctor_response: str) -> Optional[str]:

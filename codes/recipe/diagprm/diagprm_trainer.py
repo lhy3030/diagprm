@@ -124,7 +124,7 @@ def _diagprm_compute_accuracy_metrics(batch):
         "diagprm/turn_count_mean": _safe_mean('turn_count'),
         "diagprm/final_kg_coverage_mean": _safe_mean('final_kg_coverage'),
         "diagprm/valid_format_rate": _safe_mean('valid_format_rate'),
-        "diagprm/r_hyp_mean": _safe_mean('r_hyp_mean'),
+        "diagprm/premature_diag_rate": _safe_mean('premature_diag_rate'),
         "diagprm/delta_kg_sum_mean": _safe_mean('delta_kg_sum'),
     }
 

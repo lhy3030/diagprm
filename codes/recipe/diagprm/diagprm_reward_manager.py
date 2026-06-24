@@ -3,8 +3,7 @@ DiagPRM - Multi-Turn Reward Manager
 
 继承自 verl 的 AbstractRewardManager，重写 __call__ 以支持：
   1. Turn-level KG 覆盖率差分奖励
-  2. 假设正确性奖励
-  3. 确诊奖励（episode 末）
+  2. 确诊奖励（episode 末）
 
 奖励分配策略：
   - process_reward：放在该轮 end_position（密集信号）
@@ -38,7 +37,7 @@ class DiagPRMRewardManager(AbstractRewardManager):
       tokenizer       : HF tokenizer
       num_examine     : 日志中展示的样本数
       kg_path         : master_kg.json 路径
-      reward_params   : 各奖励系数字典（beta/gamma1/r_max/tau 等）
+      reward_params   : 各奖励系数字典（beta/r_max/tau 等）
     """
 
     def __init__(
@@ -57,18 +56,14 @@ class DiagPRMRewardManager(AbstractRewardManager):
         # 奖励系数（可通过 config.reward_coefficients 覆盖）
         self.reward_params = {
             "beta": 1.0,        # KG 覆盖率差分系数
-            "gamma1": 0.3,      # 假设正确性系数
             "turn_coef": 1.0,   # Turn 奖励总系数：r(k) = turn_coef * r_turn + r_diag
             "r_max": 2.0,       # 最大确诊奖励
             "tau": 0.5,         # 过早确诊 KG 覆盖率阈值
-            "format_score": 0.1,
             "weighted": True,
-            "evidence_gated_hyp": True,
-            "wrong_hyp_penalty_scale": 0.5,
+            "min_new_facts_for_diagnosis": 2,
+            "r_premature_diag": 0.0,
             "r_wrong_diag": -1.0,
             "r_timeout": -1.0,
-            "unknown_penalty": -0.05,
-            "duplicate_penalty": -0.05,
         }
         if reward_coefficients:
             self.reward_params.update(reward_coefficients)
@@ -201,7 +196,6 @@ class DiagPRMRewardManager(AbstractRewardManager):
                         "turn_end_positions": [],
                         "turn_process_rewards": [],
                         "outcome_reward": 0.0,
-                        "turn_hypotheses": [],
                     })
                     reward_extra_info["diagprm_trajectory"].append(
                         self._build_diagprm_trajectory(
@@ -251,12 +245,10 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 reward_extra_info["turn_count"].append(len(_details) if _details else 0)
                 reward_extra_info["process_rewards_sum"].append(_aggregate_reward)
                 reward_extra_info["outcome_reward"].append(_final_r_diag)
-                _turn_hypotheses = [d.get("curr_hypothesis", "") or "" for d in _details] if _details else []
                 reward_extra_info["adv_compute_info"].append({
                     "turn_end_positions": [_last_pos] if (_has_history_rewards and _last_pos >= 0) else [],
                     "turn_process_rewards": [_aggregate_reward] if (_has_history_rewards and _last_pos >= 0) else [],
                     "outcome_reward": _final_r_diag,
-                    "turn_hypotheses": [_turn_hypotheses[-1]] if (_turn_hypotheses and _last_pos >= 0) else [],
                 })
                 reward_extra_info["diagprm_trajectory"].append(
                     self._build_diagprm_trajectory(
@@ -300,14 +292,12 @@ class DiagPRMRewardManager(AbstractRewardManager):
             # 详细 metrics
             self._update_detailed_metrics(details_list, reward_extra_info)
 
-            # adv_compute_info 供 Turn-level GRPO 使用
-            # 传入 total_rewards（已含 turn_coef 系数）以及每轮的主假设（用于假设感知分组）
-            turn_hypotheses = [d.get("curr_hypothesis", "") or "" for d in details_list]
+            # adv_compute_info 供 Turn-level GRPO 使用。
+            # 主方法不再按 hypothesis 分组；advantage 侧会按同一 prompt 的 turn index 分组。
             reward_extra_info["adv_compute_info"].append({
                 "turn_end_positions": turn_end_positions,
                 "turn_process_rewards": total_rewards,  # r(k) = turn_coef*r_turn + r_diag
                 "outcome_reward": final_r_diag,
-                "turn_hypotheses": turn_hypotheses,     # 每轮的 primary hypothesis（假设感知分组用）
             })
             reward_extra_info["diagprm_trajectory"].append(
                 self._build_diagprm_trajectory(
@@ -419,9 +409,9 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     "total": float(total_rewards[idx]) if idx < len(total_rewards) else 0.0,
                     "r_turn": float(detail.get("r_turn", 0.0)),
                     "delta_kg": float(detail.get("delta_kg", 0.0)),
-                    "r_hyp": float(detail.get("r_hyp", 0.0)),
                     "r_diag": float(detail.get("r_diag", 0.0)),
                     "coverage_after": float(detail.get("coverage_after", 0.0)),
+                    "n_new_symptoms_collected": int(detail.get("n_new_symptoms_collected", 0)),
                 },
             })
         return {
@@ -438,23 +428,24 @@ class DiagPRMRewardManager(AbstractRewardManager):
     ) -> None:
         """统计每轮细节 metrics，写入 reward_extra_info。"""
         delta_kg_sum = 0.0
-        r_hyp_sum = 0.0
         n_valid_format = 0
         final_coverage = 0.0
         is_correct = False
+        premature_diag = False
 
         for idx, d in enumerate(details_list):
             delta_kg_sum += d.get("delta_kg", 0.0)
-            r_hyp_sum += d.get("r_hyp", 0.0)
             if d.get("has_valid_format"):
                 n_valid_format += 1
             if d.get("is_correct_diagnosis"):
                 is_correct = True
+            if d.get("premature_diagnosis"):
+                premature_diag = True
             final_coverage = d.get("coverage_after", final_coverage)
 
         n = max(len(details_list), 1)
         reward_extra_info["delta_kg_sum"].append(delta_kg_sum)
-        reward_extra_info["r_hyp_mean"].append(r_hyp_sum / n)
         reward_extra_info["valid_format_rate"].append(n_valid_format / n)
         reward_extra_info["final_kg_coverage"].append(final_coverage)
         reward_extra_info["is_correct"].append(1 if is_correct else 0)
+        reward_extra_info["premature_diag_rate"].append(1 if premature_diag else 0)
