@@ -30,6 +30,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from langchain_core.messages import HumanMessage, SystemMessage
 
+# 全局信号量：限制同时发往外部 Patient API 的并发请求数，避免 429 rate limit
+# 通过环境变量 PATIENT_API_CONCURRENCY 控制，默认 3
+_PATIENT_API_SEM: Optional[asyncio.Semaphore] = None
+
+def _get_patient_sem() -> asyncio.Semaphore:
+    global _PATIENT_API_SEM
+    if _PATIENT_API_SEM is None:
+        limit = int(os.environ.get("PATIENT_API_CONCURRENCY", "3"))
+        _PATIENT_API_SEM = asyncio.Semaphore(limit)
+    return _PATIENT_API_SEM
+
 from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics
 from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError
 from recipe.diagprm.kg_utils import (
@@ -551,23 +562,34 @@ class DiagPRMAgentLoop(AgentLoopBase):
         _proxy = None if _is_local else (
             os.environ.get("PATIENT_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
         )
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    proxy=_proxy,
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data["choices"][0]["message"]["content"].strip()
-                    else:
-                        text = await resp.text()
-                        print(f"[Patient API] HTTP {resp.status}: {text[:200]}")
-        except Exception as e:
-            print(f"[Patient API] call failed: {e}")
+        _sem = _get_patient_sem() if not _is_local else None
+        for _attempt in range(8):
+            try:
+                async with (_sem if _sem else asyncio.nullcontext()):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            url,
+                            json=payload,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60),
+                            proxy=_proxy,
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                return data["choices"][0]["message"]["content"].strip()
+                            elif resp.status == 429:
+                                wait = min(2 ** _attempt, 60)
+                                text = await resp.text()
+                                print(f"[Patient API] 429 rate limit, retry {_attempt+1}/8 after {wait}s")
+                                await asyncio.sleep(wait)
+                            else:
+                                text = await resp.text()
+                                print(f"[Patient API] HTTP {resp.status}: {text[:200]}")
+                                break
+            except Exception as e:
+                print(f"[Patient API] call failed: {e}")
+                if _attempt < 7:
+                    await asyncio.sleep(min(2 ** _attempt, 60))
 
         # Fallback: simple keyword match against hidden symptom facts.
         return self._rule_based_patient_fallback(symptom_facts, question)
@@ -704,25 +726,36 @@ class DiagPRMAgentLoop(AgentLoopBase):
         _proxy = None if _is_local else (
             os.environ.get("PATIENT_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
         )
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    proxy=_proxy,
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        opening = data["choices"][0]["message"]["content"].strip()
-                        if opening:
-                            return opening
-                    else:
-                        text = await resp.text()
-                        print(f"[Patient Opening API] HTTP {resp.status}: {text[:200]}")
-        except Exception as e:
-            print(f"[Patient Opening API] call failed: {e}")
+        _sem = _get_patient_sem() if not _is_local else None
+        for _attempt in range(8):
+            try:
+                async with (_sem if _sem else asyncio.nullcontext()):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            url,
+                            json=payload,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60),
+                            proxy=_proxy,
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                opening = data["choices"][0]["message"]["content"].strip()
+                                if opening:
+                                    return opening
+                            elif resp.status == 429:
+                                wait = min(2 ** _attempt, 60)
+                                text = await resp.text()
+                                print(f"[Patient Opening API] 429 rate limit, retry {_attempt+1}/8 after {wait}s")
+                                await asyncio.sleep(wait)
+                            else:
+                                text = await resp.text()
+                                print(f"[Patient Opening API] HTTP {resp.status}: {text[:200]}")
+                                break
+            except Exception as e:
+                print(f"[Patient Opening API] call failed: {e}")
+                if _attempt < 7:
+                    await asyncio.sleep(min(2 ** _attempt, 60))
 
         # Fallback: 直接拼接
         syms_natural = ", ".join(initial_symptoms)
