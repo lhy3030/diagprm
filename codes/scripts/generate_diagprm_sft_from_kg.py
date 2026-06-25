@@ -275,13 +275,12 @@ def llm_rewrite_opening(
         "messages": [
             {
                 "role": "system",
-                "content": "You rewrite a patient's first utterance in a controlled medical dialogue. Preserve the exact symptom facts.",
+                "content": "You rewrite a patient's first utterance in a controlled medical dialogue. Preserve the exact symptom facts. /no_think",
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
         "temperature": 0.2,
-        "max_tokens": 192,
-        "enable_thinking": False,
+        "max_tokens": 512,
     }
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -296,7 +295,7 @@ def llm_rewrite_opening(
             msg = data["choices"][0]["message"]
             content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
             parsed = json.loads(extract_json_object(content))
-            rewritten = str(parsed.get("opening", "")).strip()
+            rewritten = str(parsed.get("opening", "") if isinstance(parsed, dict) else parsed).strip()
             if rewritten:
                 print(f"    [opening] {rewritten[:120]}", flush=True)
                 return rewritten
@@ -348,13 +347,12 @@ def llm_rewrite_pair(
         "messages": [
             {
                 "role": "system",
-                "content": "You rewrite controlled medical dialogue turns. Preserve the exact medical fact.",
+                "content": "You rewrite controlled medical dialogue turns. Preserve the exact medical fact. /no_think",
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
         "temperature": 0.2,
-        "max_tokens": 256,
-        "enable_thinking": False,
+        "max_tokens": 512,
     }
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -369,8 +367,11 @@ def llm_rewrite_pair(
             msg = data["choices"][0]["message"]
             content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
             parsed = json.loads(extract_json_object(content))
-            q = str(parsed.get("question", "")).strip()
-            a = str(parsed.get("answer", "")).strip()
+            if isinstance(parsed, dict):
+                q = str(parsed.get("question", "")).strip()
+                a = str(parsed.get("answer", "")).strip()
+            else:
+                q, a = "", ""
             if q and a and disease.lower() not in (q + " " + a).lower():
                 print(f"    [pair/{symptom[:30]}] Q: {q[:80]}", flush=True)
                 print(f"    [pair/{symptom[:30]}] A: {a[:80]}", flush=True)
@@ -426,14 +427,13 @@ def llm_generate_question(
         "messages": [
             {
                 "role": "system",
-                "content": "You are generating one doctor's follow-up question for a controlled diagnostic dialogue. Preserve the target medical fact.",
+                "content": "You are generating one doctor's follow-up question for a controlled diagnostic dialogue. Preserve the target medical fact. /no_think",
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
         "temperature": 0.7,
-        "max_tokens": 192,
+        "max_tokens": 512,
         "stream": False,
-        "enable_thinking": False,
     }
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -448,7 +448,11 @@ def llm_generate_question(
             msg = data["choices"][0]["message"]
             content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
             parsed = json.loads(extract_json_object(content))
-            question = str(parsed.get("question", "")).strip()
+            if isinstance(parsed, dict):
+                question = str(parsed.get("question", "")).strip()
+            else:
+                # LLM returned a plain string instead of JSON object
+                question = str(parsed).strip()
             if (
                 question
                 and not question_mentions_diagnosis(question, disease)
@@ -471,7 +475,14 @@ def llm_generate_question(
     return ""
 
 
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks emitted by Qwen3 thinking mode."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def extract_json_object(text: str) -> str:
+    text = strip_thinking(text)
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.I).strip()
         text = re.sub(r"```$", "", text).strip()
