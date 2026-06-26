@@ -100,6 +100,23 @@ BAD_SYMPTOM_PATTERNS = [
 ]
 
 NON_PATIENT_FACING_PATTERNS = [
+    r"\basthma\b",
+    r"\bsyndrome\b",
+    r"\bdisease\b",
+    r"\bpalsy\b",
+    r"\bneutrophilia\b",
+    r"\bhyperresponsiveness\b",
+    r"\bhypophosphatemia\b",
+    r"\bfgf\d+\b",
+    r"\bradiolucent\b",
+    r"\blesions?\b",
+    r"\binfants?\b",
+    r"\bpreterm\b",
+    r"\bnewborn\b",
+    r"\boccupational\b",
+    r"\bwork-aggravated\b",
+    r"\brisk of\b",
+    r"\bhigh risk\b",
     r"\bgene\b",
     r"\bmutation\b",
     r"\bpolymorphism\b",
@@ -137,6 +154,8 @@ TEST_RESULT_PATTERNS = [
     r"\bscan\b",
     r"\btest\b",
     r"\blab(oratory)?\b",
+    r"\bphosphate\b",
+    r"\bblood counts?\b",
 ]
 
 PRIOR_CLINICAL_FINDING_PATTERNS = [
@@ -153,6 +172,11 @@ PRIOR_CLINICAL_FINDING_PATTERNS = [
     r"\bglottic opening\b",
     r"\bfilum terminale\b",
     r"\bmyelin deficiency\b",
+    r"\bcranial nerve\b",
+    r"\boculomotor\b",
+    r"\bnerve palsy\b",
+    r"\bbulbar\b",
+    r"\bhospital admission\b",
     r"\bagenesis\b",
     r"\bhypoplasia\b",
     r"\baplasia\b",
@@ -174,6 +198,17 @@ CAREGIVER_OBSERVABLE_PATTERNS = [
 
 PATIENT_TEXT_BAD_PATTERNS = [
     r"\bthe patient\b",
+    r"\bbronchial hyperresponsiveness\b",
+    r"\bsputum neutrophilia\b",
+    r"\bbulbar symptoms?\b",
+    r"\bconvulsions\b",
+    r"\basthma\b",
+    r"\bpalsy\b",
+    r"\bhypophosphatemia\b",
+    r"\bfgf\d+\b",
+    r"\bradiolucent\b",
+    r"\blesions?\b",
+    r"\bpreterm babies\b",
     r"\bfilum\b",
     r"\bterminale\b",
     r"\bhypoplasia\b",
@@ -262,6 +297,21 @@ def is_sft_surface_allowed(surface_type: str) -> bool:
         "prior_clinical_finding",
         "test_result",
     }
+
+
+def is_opening_surface_allowed(surface_type: str) -> bool:
+    return surface_type in {"patient_observable", "caregiver_observable"}
+
+
+def filter_opening_symptoms(initial_symptoms: list[str]) -> list[str]:
+    filtered = []
+    for symptom in initial_symptoms:
+        symptom_norm = normalize_text(symptom)
+        if not symptom_norm:
+            continue
+        if is_opening_surface_allowed(classify_fact_surface(symptom_norm)):
+            filtered.append(symptom_norm)
+    return filtered
 
 
 def symptom_df(cases: list[dict[str, Any]]) -> dict[str, int]:
@@ -391,6 +441,8 @@ def verify_candidate(
     for idx, message in enumerate(messages):
         role = message.get("role")
         content = message.get("content", "")
+        if idx == 1 and role == "user" and has_bad_patient_text(content):
+            reasons.append("bad_opening_text")
         if role == "assistant":
             try:
                 obj = json.loads(content)
@@ -407,6 +459,14 @@ def verify_candidate(
             reasons.append("disease_leak_before_final")
 
     for item in trace:
+        if item.get("action") == "opening":
+            opening = str(item.get("text", ""))
+            if has_bad_patient_text(opening):
+                reasons.append("bad_opening_text")
+            for symptom in item.get("initial_symptoms", []):
+                if is_verbatim_fact_leak(str(symptom), opening, classify_fact_surface(str(symptom))):
+                    reasons.append("opening_verbatim_fact_leak")
+            continue
         if item.get("action") != "ask" or item.get("is_noise"):
             continue
         symptom = normalize_text(item.get("symptom", ""))
@@ -767,18 +827,21 @@ def make_messages(
     teacher_temperature_tag: int,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]], dict[str, Any]]:
     messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
-    opening = make_opening(case.get("initial_symptoms", []), rng)
+    opening_symptoms = filter_opening_symptoms(case.get("initial_symptoms", []))
+    if not opening_symptoms:
+        raise ValueError("no patient-facing opening symptoms")
+    opening = make_opening(opening_symptoms, rng)
     if use_llm:
         opening = llm_rewrite_opening(
             api_base=api_base,
             api_key=api_key,
             model=model,
-            initial_symptoms=case.get("initial_symptoms", []),
+            initial_symptoms=opening_symptoms,
             opening=opening,
         )
     messages.append({"role": "user", "content": opening})
 
-    trace = [{"turn_id": 0, "action": "opening", "initial_symptoms": case.get("initial_symptoms", []), "text": opening}]
+    trace = [{"turn_id": 0, "action": "opening", "initial_symptoms": opening_symptoms, "text": opening}]
     previous_questions: list[str] = []
     collected_symptoms = [normalize_text(x) for x in case.get("initial_symptoms", [])]
     repeated_questions = 0
@@ -1134,6 +1197,8 @@ def generate_split(
 def compute_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ask_turns = 0
     disease_leaks = 0
+    bad_opening_text = 0
+    opening_verbatim_fact_leaks = 0
     bad_patient_text = 0
     verbatim_fact_leaks = 0
     third_person_patient = 0
@@ -1150,8 +1215,18 @@ def compute_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 and disease in normalize_text(message.get("content", ""))
             ):
                 disease_leaks += 1
+            if idx == 1 and message.get("role") == "user" and has_bad_patient_text(message.get("content", "")):
+                bad_opening_text += 1
 
         for item in row.get("sft_trace", []):
+            if item.get("action") == "opening":
+                opening = str(item.get("text", ""))
+                if has_bad_patient_text(opening):
+                    bad_opening_text += 1
+                for symptom in item.get("initial_symptoms", []):
+                    if is_verbatim_fact_leak(str(symptom), opening, classify_fact_surface(str(symptom))):
+                        opening_verbatim_fact_leaks += 1
+                continue
             if item.get("action") != "ask" or item.get("is_noise"):
                 continue
             ask_turns += 1
@@ -1172,6 +1247,8 @@ def compute_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ask_turns": ask_turns,
         "surface_type_counts": surface_counts,
         "disease_leaks": disease_leaks,
+        "bad_opening_text": bad_opening_text,
+        "opening_verbatim_fact_leaks": opening_verbatim_fact_leaks,
         "bad_patient_text": bad_patient_text,
         "third_person_patient": third_person_patient,
         "verbatim_fact_leaks": verbatim_fact_leaks,
