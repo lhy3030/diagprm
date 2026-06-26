@@ -27,6 +27,8 @@ CANDIDATES_PER_CASE="${CANDIDATES_PER_CASE:-4}"
 TOP_K_PER_CASE="${TOP_K_PER_CASE:-1}"
 MIN_KG_COVERAGE="${MIN_KG_COVERAGE:-0.5}"
 MIN_NEW_FACTS="${MIN_NEW_FACTS:-2}"
+CASE_STRIDE="${CASE_STRIDE:-1}"
+CASE_OFFSET="${CASE_OFFSET:-0}"
 
 USE_LLM="${USE_LLM:-1}"
 TEACHER_GENERATE_QUESTIONS="${TEACHER_GENERATE_QUESTIONS:-1}"
@@ -48,8 +50,17 @@ else
   LLM_MODEL="${LLM_MODEL:-qwen3-32b-meituan}"
 fi
 
+# Use diagprm conda env python if available (has pandas, vllm deps), else fallback
+if [ -x "/opt/conda/envs/diagprm/bin/python3" ]; then
+  PYTHON3="/opt/conda/envs/diagprm/bin/python3"
+elif [ -x "${HOME}/miniconda3/envs/diagprm/bin/python3" ]; then
+  PYTHON3="${HOME}/miniconda3/envs/diagprm/bin/python3"
+else
+  PYTHON3="python3"
+fi
+
 CMD=(
-  python3 "${SCRIPT_DIR}/generate_diagprm_sft_from_kg.py"
+  "${PYTHON3}" "${SCRIPT_DIR}/generate_diagprm_sft_from_kg.py"
   --dataset_dir "${DATASET_DIR}"
   --output_dir "${OUTPUT_BASE_DIR}"
   --timestamp_output
@@ -63,6 +74,8 @@ CMD=(
   --top_k_per_case "${TOP_K_PER_CASE}"
   --min_kg_coverage "${MIN_KG_COVERAGE}"
   --min_new_facts "${MIN_NEW_FACTS}"
+  --case_stride "${CASE_STRIDE}"
+  --case_offset "${CASE_OFFSET}"
 )
 
 if [ "${USE_LLM}" = "1" ]; then
@@ -86,6 +99,7 @@ echo "[INFO] Candidates per case:    ${CANDIDATES_PER_CASE}"
 echo "[INFO] Top-k per case:         ${TOP_K_PER_CASE}"
 echo "[INFO] Min KG coverage:        ${MIN_KG_COVERAGE}"
 echo "[INFO] Min new facts:          ${MIN_NEW_FACTS}"
+echo "[INFO] Case shard:             ${CASE_OFFSET}/${CASE_STRIDE}"
 echo "[INFO] Use LLM:                ${USE_LLM}"
 echo "[INFO] Teacher gen questions:  ${TEACHER_GENERATE_QUESTIONS}"
 echo "[INFO] vLLM mode:              ${USE_VLLM}"

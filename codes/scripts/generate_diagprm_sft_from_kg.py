@@ -1027,12 +1027,19 @@ def generate_split(
     teacher_generate_questions: bool,
     min_kg_coverage: float,
     min_new_facts: int,
+    case_stride: int,
+    case_offset: int,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     cases = load_jsonl(input_path)
     rng.shuffle(cases)
     df = symptom_df(cases)
     n_cases = len(cases)
+    if case_stride < 1:
+        raise ValueError("case_stride must be >= 1")
+    if case_offset < 0 or case_offset >= case_stride:
+        raise ValueError("case_offset must be in [0, case_stride)")
+    cases = [case for idx, case in enumerate(cases) if idx % case_stride == case_offset]
     if max_cases is not None:
         cases = cases[:max_cases]
 
@@ -1119,6 +1126,8 @@ def generate_split(
         "use_llm": use_llm,
         "candidates_per_case": candidates_per_case,
         "top_k_per_case": top_k_per_case,
+        "case_stride": case_stride,
+        "case_offset": case_offset,
     }
 
 
@@ -1192,6 +1201,8 @@ def main() -> None:
     parser.add_argument("--teacher_generate_questions", action="store_true")
     parser.add_argument("--min_kg_coverage", type=float, default=0.5)
     parser.add_argument("--min_new_facts", type=int, default=2)
+    parser.add_argument("--case_stride", type=int, default=1)
+    parser.add_argument("--case_offset", type=int, default=0)
     args = parser.parse_args()
 
     if args.use_llm and (not args.llm_api_base or not args.llm_model):
@@ -1230,6 +1241,8 @@ def main() -> None:
             teacher_generate_questions=args.teacher_generate_questions,
             min_kg_coverage=args.min_kg_coverage,
             min_new_facts=args.min_new_facts,
+            case_stride=args.case_stride,
+            case_offset=args.case_offset,
         )
     )
     summaries.append(
@@ -1251,6 +1264,8 @@ def main() -> None:
             teacher_generate_questions=args.teacher_generate_questions,
             min_kg_coverage=args.min_kg_coverage,
             min_new_facts=args.min_new_facts,
+            case_stride=args.case_stride,
+            case_offset=args.case_offset,
         )
     )
 
@@ -1267,6 +1282,8 @@ def main() -> None:
         "teacher_generate_questions": args.teacher_generate_questions,
         "min_kg_coverage": args.min_kg_coverage,
         "min_new_facts": args.min_new_facts,
+        "case_stride": args.case_stride,
+        "case_offset": args.case_offset,
         "splits": summaries,
         "notes": [
             "Doctor sees only system prompt, patient natural-language opening, and patient natural-language answers.",
