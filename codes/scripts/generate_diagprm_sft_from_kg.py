@@ -104,10 +104,21 @@ NON_PATIENT_FACING_PATTERNS = [
     r"\bsyndrome\b",
     r"\bdisease\b",
     r"\bpalsy\b",
+    r"\bparesis\b",
     r"\bneutrophilia\b",
     r"\bhyperresponsiveness\b",
     r"\bhypophosphatemia\b",
     r"\bfgf\d+\b",
+    r"\bsurfactant\b",
+    r"\bmitochondrial\b",
+    r"\bmitochondrion\b",
+    r"\blrrna\b",
+    r"\bexport\b",
+    r"\bbone marrow failure\b",
+    r"\bblood counts?\b",
+    r"\btube feeding\b",
+    r"\bventilator\b",
+    r"\bventilator-associated\b",
     r"\bradiolucent\b",
     r"\blesions?\b",
     r"\binfants?\b",
@@ -198,6 +209,15 @@ CAREGIVER_OBSERVABLE_PATTERNS = [
 
 PATIENT_TEXT_BAD_PATTERNS = [
     r"\bthe patient\b",
+    r"\bblood counts?\b",
+    r"\bbone marrow failure\b",
+    r"\btube\b",
+    r"\bventilator\b",
+    r"\bsurfactant\b",
+    r"\bmitochondrial\b",
+    r"\bmitochondrion\b",
+    r"\blrrna\b",
+    r"\bexport\b",
     r"\bbronchial hyperresponsiveness\b",
     r"\bsputum neutrophilia\b",
     r"\bbulbar symptoms?\b",
@@ -226,6 +246,16 @@ PATIENT_TEXT_BAD_PATTERNS = [
     r"\bstandard definition\b",
     r"\bfirst description\b",
     r"\bfirst symptom\b",
+]
+
+BAD_FIRST_PERSON_CASE_PATTERNS = [
+    r"\bnewborn\b",
+    r"\bneonatal\b",
+    r"\binfants?\b",
+    r"\bbabies\b",
+    r"\bpreterm\b",
+    r"\bventilator\b",
+    r"\btube feeding\b",
 ]
 
 
@@ -312,6 +342,19 @@ def filter_opening_symptoms(initial_symptoms: list[str]) -> list[str]:
         if is_opening_surface_allowed(classify_fact_surface(symptom_norm)):
             filtered.append(symptom_norm)
     return filtered
+
+
+def is_first_person_case_allowed(case: dict[str, Any]) -> bool:
+    fields = [
+        str(case.get("disease", "")),
+        str(case.get("disease_group", "")),
+        " ".join(str(x) for x in case.get("initial_symptoms", [])),
+    ]
+    for fact in case.get("symptom_facts", []):
+        if isinstance(fact, dict):
+            fields.append(str(fact.get("text", "")))
+    text = normalize_text(" ".join(fields))
+    return not any(re.search(pattern, text) for pattern in BAD_FIRST_PERSON_CASE_PATTERNS)
 
 
 def symptom_df(cases: list[dict[str, Any]]) -> dict[str, int]:
@@ -1113,6 +1156,10 @@ def generate_split(
     for case_idx, case in enumerate(cases, start=1):
         disease_name = case.get("disease", "?")[:40]
         print(f"[{split_name}] {case_idx}/{n_total}  {disease_name}", flush=True)
+        if not is_first_person_case_allowed(case):
+            skipped += 1
+            print(f"  → skipped (not suitable for first-person patient SFT)", flush=True)
+            continue
         selected_candidates = generate_case_candidates(
             case=case,
             df=df,
