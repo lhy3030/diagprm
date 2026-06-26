@@ -99,6 +99,100 @@ BAD_SYMPTOM_PATTERNS = [
     r"\bmechanism\b",
 ]
 
+NON_PATIENT_FACING_PATTERNS = [
+    r"\bgene\b",
+    r"\bmutation\b",
+    r"\bpolymorphism\b",
+    r"\bchromosome\b",
+    r"\bprotein\b",
+    r"\bpeptide\b",
+    r"\bpathway\b",
+    r"\bmechanism\b",
+    r"\bstandard definition\b",
+    r"\bfirst symptom\b",
+    r"\bfirst description\b",
+    r"\bpoor outcomes?\b",
+    r"\bacquired resistance\b",
+    r"\bdiagnos",
+]
+
+TEST_RESULT_PATTERNS = [
+    r"\bserum\b",
+    r"\bplasma\b",
+    r"\burine\b",
+    r"\biga\b",
+    r"\bigg\b",
+    r"\bigm\b",
+    r"\blevels?\b",
+    r"\bconcentration\b",
+    r"\bexcretion\b",
+    r"\bct\b",
+    r"\bmri\b",
+    r"\bultrasound\b",
+    r"\bradiograph",
+    r"\bx-ray\b",
+    r"\bimaging\b",
+    r"\beeg\b",
+    r"\bechocardiography\b",
+    r"\bscan\b",
+    r"\btest\b",
+    r"\blab(oratory)?\b",
+]
+
+PRIOR_CLINICAL_FINDING_PATTERNS = [
+    r"\bbiopsy\b",
+    r"\bpatholog",
+    r"\bhistolog",
+    r"\bvalve\b",
+    r"\bmurmur\b",
+    r"\bcardiomegaly\b",
+    r"\blymphopenia\b",
+    r"\bimmunodeficiency\b",
+    r"\bdelayed bone age\b",
+    r"\bthymic shadow\b",
+    r"\bglottic opening\b",
+    r"\bfilum terminale\b",
+    r"\bmyelin deficiency\b",
+    r"\bagenesis\b",
+    r"\bhypoplasia\b",
+    r"\baplasia\b",
+    r"\bdysplasia\b",
+    r"\bmalformation\b",
+]
+
+CAREGIVER_OBSERVABLE_PATTERNS = [
+    r"\babnormal (head|feet|face|ear|nose|genital|limb|hand|thumb|toe)\b",
+    r"\bdeformit",
+    r"\bshort stature\b",
+    r"\bdevelopmental delay\b",
+    r"\bdelayed development\b",
+    r"\bmental retardation\b",
+    r"\bintellectual disability\b",
+    r"\bearly puberty\b",
+    r"\bdelayed puberty\b",
+]
+
+PATIENT_TEXT_BAD_PATTERNS = [
+    r"\bthe patient\b",
+    r"\bfilum\b",
+    r"\bterminale\b",
+    r"\bhypoplasia\b",
+    r"\bagenesis\b",
+    r"\baplasia\b",
+    r"\bdysplasia\b",
+    r"\bmalformation\b",
+    r"\bmorphology\b",
+    r"\blymphopenia\b",
+    r"\bpolymorphism\b",
+    r"\bmutation\b",
+    r"\bchromosome\b",
+    r"\bprotein\b",
+    r"\bpeptide\b",
+    r"\bstandard definition\b",
+    r"\bfirst description\b",
+    r"\bfirst symptom\b",
+]
+
 
 QUESTION_TEMPLATES = [
     "Have you noticed {symptom}?",
@@ -145,6 +239,31 @@ def is_patient_reportable(symptom: str) -> bool:
     return not any(re.search(pattern, s) for pattern in BAD_SYMPTOM_PATTERNS)
 
 
+def classify_fact_surface(symptom: str) -> str:
+    """Classify how a KG fact may be safely surfaced in patient-facing text."""
+    s = normalize_text(symptom)
+    if len(s) < 3:
+        return "not_patient_facing"
+    if any(re.search(pattern, s) for pattern in NON_PATIENT_FACING_PATTERNS):
+        return "not_patient_facing"
+    if any(re.search(pattern, s) for pattern in TEST_RESULT_PATTERNS):
+        return "test_result"
+    if any(re.search(pattern, s) for pattern in PRIOR_CLINICAL_FINDING_PATTERNS):
+        return "prior_clinical_finding"
+    if any(re.search(pattern, s) for pattern in CAREGIVER_OBSERVABLE_PATTERNS):
+        return "caregiver_observable"
+    return "patient_observable"
+
+
+def is_sft_surface_allowed(surface_type: str) -> bool:
+    return surface_type in {
+        "patient_observable",
+        "caregiver_observable",
+        "prior_clinical_finding",
+        "test_result",
+    }
+
+
 def symptom_df(cases: list[dict[str, Any]]) -> dict[str, int]:
     df: dict[str, int] = {}
     for case in cases:
@@ -169,22 +288,26 @@ def select_hidden_facts(
         if symptom in initial:
             continue
         weight = float(fact.get("weight", 0.0))
-        if not is_patient_reportable(symptom):
+        surface_type = classify_fact_surface(symptom)
+        if not is_sft_surface_allowed(surface_type):
             continue
         # High disease weight and low global prevalence are useful SFT targets:
         # they teach the model to ask discriminative questions.
         idf = math.log((n_cases + 1.0) / (df.get(symptom, 0) + 1.0))
         score = weight * (1.0 + idf)
-        facts.append({**fact, "text": symptom, "_score": score})
+        facts.append({**fact, "text": symptom, "surface_type": surface_type, "_score": score})
 
     if len(facts) < min_ask:
         for fact in case.get("symptom_facts", []):
             symptom = normalize_text(fact.get("text", ""))
             if symptom in initial or any(f["fact_id"] == fact.get("fact_id") for f in facts):
                 continue
+            surface_type = classify_fact_surface(symptom)
+            if not is_sft_surface_allowed(surface_type):
+                continue
             weight = float(fact.get("weight", 0.0))
             idf = math.log((n_cases + 1.0) / (df.get(symptom, 0) + 1.0))
-            facts.append({**fact, "text": symptom, "_score": weight * (1.0 + idf)})
+            facts.append({**fact, "text": symptom, "surface_type": surface_type, "_score": weight * (1.0 + idf)})
 
     facts.sort(key=lambda x: (x["_score"], x.get("weight", 0.0)), reverse=True)
     if len(facts) < min_ask:
@@ -227,6 +350,74 @@ def is_duplicate_question(question: str, previous_questions: list[str], threshol
         if overlap >= threshold:
             return True
     return False
+
+
+def has_bad_patient_text(text: str) -> bool:
+    s = normalize_text(text)
+    return any(re.search(pattern, s) for pattern in PATIENT_TEXT_BAD_PATTERNS)
+
+
+def content_words(text: str) -> set[str]:
+    stop = {
+        "the", "and", "that", "this", "with", "have", "has", "had", "been",
+        "being", "from", "into", "about", "your", "you", "patient", "symptom",
+        "present", "noticed", "experiencing", "experience", "doctor", "told",
+    }
+    return {
+        tok for tok in re.findall(r"\b[a-z][a-z0-9-]{3,}\b", normalize_text(text))
+        if tok not in stop
+    }
+
+
+def is_verbatim_fact_leak(symptom: str, answer: str, surface_type: str) -> bool:
+    if surface_type in {"prior_clinical_finding", "test_result"}:
+        return False
+    sym_words = content_words(symptom)
+    if not sym_words:
+        return False
+    ans_words = content_words(answer)
+    overlap = len(sym_words & ans_words) / max(len(sym_words), 1)
+    return overlap >= 0.8
+
+
+def verify_candidate(
+    case: dict[str, Any],
+    messages: list[dict[str, str]],
+    trace: list[dict[str, Any]],
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    disease = normalize_text(case.get("disease", ""))
+
+    for idx, message in enumerate(messages):
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "assistant":
+            try:
+                obj = json.loads(content)
+            except json.JSONDecodeError:
+                reasons.append("assistant_json_invalid")
+                continue
+            if obj.get("action") not in {"ask", "diagnose"}:
+                reasons.append("assistant_action_invalid")
+            if obj.get("action") == "ask" and not obj.get("question"):
+                reasons.append("assistant_ask_missing_question")
+            if obj.get("action") == "diagnose" and not obj.get("diagnosis"):
+                reasons.append("assistant_diagnose_missing_diagnosis")
+        if idx < len(messages) - 1 and role != "system" and disease and disease in normalize_text(content):
+            reasons.append("disease_leak_before_final")
+
+    for item in trace:
+        if item.get("action") != "ask" or item.get("is_noise"):
+            continue
+        symptom = normalize_text(item.get("symptom", ""))
+        answer = str(item.get("answer", ""))
+        surface_type = str(item.get("surface_type", "patient_observable"))
+        if has_bad_patient_text(answer):
+            reasons.append("bad_patient_text")
+        if is_verbatim_fact_leak(symptom, answer, surface_type):
+            reasons.append("verbatim_fact_leak")
+
+    return not reasons, sorted(set(reasons))
 
 
 def join_symptoms_naturally(symptoms: list[str]) -> str:
@@ -320,6 +511,7 @@ def llm_rewrite_pair(
     model: str,
     disease: str,
     symptom: str,
+    surface_type: str,
     question: str,
     answer: str,
     timeout: int = 60,
@@ -329,6 +521,7 @@ def llm_rewrite_pair(
     prompt = {
         "disease": disease,
         "symptom_fact": symptom,
+        "surface_type": surface_type,
         "doctor_question_draft": question,
         "patient_answer_draft": answer,
         "constraints": [
@@ -340,6 +533,7 @@ def llm_rewrite_pair(
             "Keep both fields concise and natural.",
             "DOCTOR question: ask in plain clinical language a real doctor uses with patients (e.g. 'Have you had any episodes where your hands or body shake uncontrollably?' not 'Have you noticed convulsions?').",
             "PATIENT answer: reply in plain everyday language a non-medical person would use. Do NOT repeat the symptom_fact word-for-word or use medical/Latin terminology. Describe the experience naturally (e.g. 'Yes, I get these shaking fits sometimes' not 'Yes, I have been experiencing convulsions.').",
+            "Use surface_type carefully: patient_observable means the patient can feel it; caregiver_observable means the patient/family can notice it; prior_clinical_finding means a doctor previously told the patient; test_result means a test/scan showed it. Do not say the patient 'feels' a test result or anatomical finding.",
         ],
     }
     payload = {
@@ -607,20 +801,21 @@ def make_messages(
             normalize_text(s)
             for s in case.get("symptoms_pool", {})
             if normalize_text(s) not in initial_set
-            and is_patient_reportable(normalize_text(s))
+            and classify_fact_surface(normalize_text(s)) == "patient_observable"
         ]
         # Remove symptoms that overlap with selected facts
         selected_texts = {normalize_text(f["text"]) for f in shuffled_facts}
         noise_candidates = [s for s in all_pool if s not in selected_texts]
         if noise_candidates:
             noise_symptom = rng.choice(noise_candidates)
-            noise_fact = {"fact_id": "NOISE", "text": noise_symptom, "weight": 0.0}
+            noise_fact = {"fact_id": "NOISE", "text": noise_symptom, "weight": 0.0, "surface_type": "patient_observable"}
             insert_pos = rng.randint(0, len(shuffled_facts))
             shuffled_facts.insert(insert_pos, noise_fact)
             noise_turn_inserted = True
 
     for turn_id, fact in enumerate(shuffled_facts, start=1):
         symptom = normalize_text(fact["text"])
+        surface_type = str(fact.get("surface_type") or classify_fact_surface(symptom))
         is_noise = fact.get("fact_id") == "NOISE"
 
         question = ""
@@ -659,6 +854,7 @@ def make_messages(
                 model=model,
                 disease=str(case["disease"]),
                 symptom=symptom,
+                surface_type=surface_type,
                 question=question,
                 answer=answer,
             )
@@ -670,6 +866,7 @@ def make_messages(
                 model=model,
                 disease=str(case["disease"]),
                 symptom=symptom,
+                surface_type=surface_type,
                 question=question,
                 answer=answer,
             )
@@ -691,6 +888,7 @@ def make_messages(
                 "action": "ask",
                 "fact_id": fact["fact_id"],
                 "symptom": symptom,
+                "surface_type": surface_type,
                 "question": question,
                 "answer": answer,
                 "is_noise": is_noise,
@@ -766,6 +964,11 @@ def generate_case_candidates(
                 teacher_temperature_tag=cand_idx,
             )
         except ValueError:
+            continue
+
+        is_valid, quality_reasons = verify_candidate(case, messages, trace)
+        metrics["quality_reasons"] = quality_reasons
+        if not is_valid:
             continue
 
         if not metrics["final_correct"]:
@@ -899,18 +1102,73 @@ def generate_split(
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     pd.DataFrame(rows).to_parquet(parquet_path, index=False)
+    quality = compute_quality_report(rows)
+    quality_path = output_dir / f"diagprm_sft_{split_name}_quality.json"
+    with quality_path.open("w", encoding="utf-8") as f:
+        json.dump(quality, f, ensure_ascii=False, indent=2)
 
     return {
         "split": split_name,
         "input": str(input_path),
         "jsonl": str(jsonl_path),
         "parquet": str(parquet_path),
+        "quality": str(quality_path),
         "written": len(rows),
         "skipped": skipped,
         "selected_cases": selected_cases,
         "use_llm": use_llm,
         "candidates_per_case": candidates_per_case,
         "top_k_per_case": top_k_per_case,
+    }
+
+
+def compute_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ask_turns = 0
+    disease_leaks = 0
+    bad_patient_text = 0
+    verbatim_fact_leaks = 0
+    third_person_patient = 0
+    surface_counts: dict[str, int] = {}
+
+    for row in rows:
+        disease = normalize_text(row.get("disease", ""))
+        messages = row.get("messages", [])
+        for idx, message in enumerate(messages):
+            if (
+                idx < len(messages) - 1
+                and message.get("role") != "system"
+                and disease
+                and disease in normalize_text(message.get("content", ""))
+            ):
+                disease_leaks += 1
+
+        for item in row.get("sft_trace", []):
+            if item.get("action") != "ask" or item.get("is_noise"):
+                continue
+            ask_turns += 1
+            surface_type = str(item.get("surface_type", "patient_observable"))
+            surface_counts[surface_type] = surface_counts.get(surface_type, 0) + 1
+            answer = str(item.get("answer", ""))
+            symptom = normalize_text(item.get("symptom", ""))
+            if re.search(r"\bthe patient\b", answer, flags=re.I):
+                third_person_patient += 1
+            if has_bad_patient_text(answer):
+                bad_patient_text += 1
+            if is_verbatim_fact_leak(symptom, answer, surface_type):
+                verbatim_fact_leaks += 1
+
+    denom = max(ask_turns, 1)
+    return {
+        "num_rows": len(rows),
+        "ask_turns": ask_turns,
+        "surface_type_counts": surface_counts,
+        "disease_leaks": disease_leaks,
+        "bad_patient_text": bad_patient_text,
+        "third_person_patient": third_person_patient,
+        "verbatim_fact_leaks": verbatim_fact_leaks,
+        "bad_patient_text_rate": bad_patient_text / denom,
+        "third_person_patient_rate": third_person_patient / denom,
+        "verbatim_fact_leak_rate": verbatim_fact_leaks / denom,
     }
 
 
@@ -1017,7 +1275,7 @@ def main() -> None:
             "Each case may generate multiple candidate trajectories; only top-k filtered candidates are kept.",
         ],
     }
-    manifest_path = args.output_dir / "sft_manifest.json"
+    manifest_path = output_dir / "sft_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
