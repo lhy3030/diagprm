@@ -1149,50 +1149,71 @@ def generate_split(
     if max_cases is not None:
         cases = cases[:max_cases]
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / f"diagprm_sft_{split_name}.jsonl"
+    parquet_path = output_dir / f"diagprm_sft_{split_name}.parquet"
+    quality_path = output_dir / f"diagprm_sft_{split_name}_quality.json"
+    progress_path = output_dir / f"diagprm_sft_{split_name}_progress.json"
+
     rows = []
     skipped = 0
     selected_cases = 0
     n_total = len(cases)
-    for case_idx, case in enumerate(cases, start=1):
-        disease_name = case.get("disease", "?")[:40]
-        print(f"[{split_name}] {case_idx}/{n_total}  {disease_name}", flush=True)
-        if not is_first_person_case_allowed(case):
-            skipped += 1
-            print(f"  → skipped (not suitable for first-person patient SFT)", flush=True)
-            continue
-        selected_candidates = generate_case_candidates(
-            case=case,
-            df=df,
-            n_cases=n_cases,
-            min_ask=min_ask,
-            max_ask=max_ask,
-            max_turns=max_turns,
-            rng=rng,
-            use_llm=use_llm,
-            api_base=api_base,
-            api_key=api_key,
-            model=model,
-            candidates_per_case=candidates_per_case,
-            top_k_per_case=top_k_per_case,
-            teacher_generate_questions=teacher_generate_questions,
-            min_kg_coverage=min_kg_coverage,
-            min_new_facts=min_new_facts,
-        )
-        if not selected_candidates:
-            skipped += 1
-            print(f"  → skipped (no valid candidates)", flush=True)
-            continue
-        selected_cases += 1
-        best = selected_candidates[0]["metrics"]
-        print(
-            f"  → ok  score={best['score']:.1f}  cov={best['kg_coverage']:.2f}"
-            f"  facts={best['num_new_facts']}  turns={best['num_turns']}"
-            f"  correct={best['final_correct']}",
-            flush=True,
-        )
-        for rank, candidate in enumerate(selected_candidates, start=1):
-            rows.append(
-                {
+    def write_progress(processed_cases: int) -> None:
+        progress = {
+            "split": split_name,
+            "processed_cases": processed_cases,
+            "total_cases": n_total,
+            "selected_cases": selected_cases,
+            "skipped": skipped,
+            "written": len(rows),
+            "jsonl": str(jsonl_path),
+        }
+        with progress_path.open("w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+
+    with jsonl_path.open("w", encoding="utf-8") as jsonl_f:
+        for case_idx, case in enumerate(cases, start=1):
+            disease_name = case.get("disease", "?")[:40]
+            print(f"[{split_name}] {case_idx}/{n_total}  {disease_name}", flush=True)
+            if not is_first_person_case_allowed(case):
+                skipped += 1
+                print(f"  → skipped (not suitable for first-person patient SFT)", flush=True)
+                write_progress(case_idx)
+                continue
+            selected_candidates = generate_case_candidates(
+                case=case,
+                df=df,
+                n_cases=n_cases,
+                min_ask=min_ask,
+                max_ask=max_ask,
+                max_turns=max_turns,
+                rng=rng,
+                use_llm=use_llm,
+                api_base=api_base,
+                api_key=api_key,
+                model=model,
+                candidates_per_case=candidates_per_case,
+                top_k_per_case=top_k_per_case,
+                teacher_generate_questions=teacher_generate_questions,
+                min_kg_coverage=min_kg_coverage,
+                min_new_facts=min_new_facts,
+            )
+            if not selected_candidates:
+                skipped += 1
+                print(f"  → skipped (no valid candidates)", flush=True)
+                write_progress(case_idx)
+                continue
+            selected_cases += 1
+            best = selected_candidates[0]["metrics"]
+            print(
+                f"  → ok  score={best['score']:.1f}  cov={best['kg_coverage']:.2f}"
+                f"  facts={best['num_new_facts']}  turns={best['num_turns']}"
+                f"  correct={best['final_correct']}",
+                flush=True,
+            )
+            for rank, candidate in enumerate(selected_candidates, start=1):
+                row = {
                     "messages": candidate["messages"],
                     "enable_thinking": False,
                     "data_source": "diagprm_clean_v2_sft",
@@ -1206,21 +1227,20 @@ def generate_split(
                     "candidate_signature": list(candidate["signature"]),
                     "candidate_metrics": candidate["metrics"],
                 }
-            )
+                rows.append(row)
+                jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                jsonl_f.flush()
+                os.fsync(jsonl_f.fileno())
+                print(f"  → saved row {len(rows)} to {jsonl_path}", flush=True)
+
+            write_progress(case_idx)
 
     print(
         f"\n[{split_name}] done: {selected_cases} ok / {skipped} skipped / {len(rows)} rows → saving...",
         flush=True,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = output_dir / f"diagprm_sft_{split_name}.jsonl"
-    parquet_path = output_dir / f"diagprm_sft_{split_name}.parquet"
-    with jsonl_path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     pd.DataFrame(rows).to_parquet(parquet_path, index=False)
     quality = compute_quality_report(rows)
-    quality_path = output_dir / f"diagprm_sft_{split_name}_quality.json"
     with quality_path.open("w", encoding="utf-8") as f:
         json.dump(quality, f, ensure_ascii=False, indent=2)
 
@@ -1230,6 +1250,7 @@ def generate_split(
         "jsonl": str(jsonl_path),
         "parquet": str(parquet_path),
         "quality": str(quality_path),
+        "progress": str(progress_path),
         "written": len(rows),
         "skipped": skipped,
         "selected_cases": selected_cases,
