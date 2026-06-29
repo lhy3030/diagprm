@@ -47,10 +47,12 @@ export MIN_ASK="${MIN_ASK:-2}"
 export MAX_ASK="${MAX_ASK:-4}"
 export MAX_TURNS="${MAX_TURNS:-5}"
 export SEED="${SEED:-42}"
+export SHARD_SEED="${SHARD_SEED:-${SEED}}"
 export CANDIDATES_PER_CASE="${CANDIDATES_PER_CASE:-4}"
 export TOP_K_PER_CASE="${TOP_K_PER_CASE:-1}"
 export MIN_KG_COVERAGE="${MIN_KG_COVERAGE:-0.5}"
 export MIN_NEW_FACTS="${MIN_NEW_FACTS:-2}"
+export EXCLUDE_CASE_IDS_FILE="${EXCLUDE_CASE_IDS_FILE:-}"
 export USE_LLM=1
 export USE_VLLM=1
 export TEACHER_GENERATE_QUESTIONS=1
@@ -86,6 +88,8 @@ echo "[INFO] Base port:     ${BASE_PORT}"
 echo "[INFO] Dataset dir:   ${DATASET_DIR}"
 echo "[INFO] Output root:   ${OUTPUT_ROOT}"
 echo "[INFO] Log dir:       ${LOG_DIR}"
+echo "[INFO] Shard seed:    ${SHARD_SEED}"
+echo "[INFO] Exclude ids:   ${EXCLUDE_CASE_IDS_FILE:-<none>}"
 echo "======================================================================"
 
 for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
@@ -139,7 +143,9 @@ for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
     export CASE_STRIDE="${NUM_WORKERS}"
     export CASE_OFFSET="${worker_id}"
     export OUTPUT_BASE_DIR="${worker_output}"
-    export SEED="$((SEED + worker_id))"
+    # All workers must use the same case-order seed before applying
+    # CASE_OFFSET/CASE_STRIDE; otherwise shuffled shards overlap.
+    export SEED="${SHARD_SEED}"
     bash "${SCRIPT_DIR}/run_generate_diagprm_sft_teacher.sh"
   ) > "${worker_log}" 2>&1 &
   WORKER_PIDS+=("$!")

@@ -297,6 +297,19 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_case_id_set(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    ids: set[str] = set()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ids.add(line.split()[0])
+    return ids
+
+
 def is_patient_reportable(symptom: str) -> bool:
     s = normalize_text(symptom)
     if len(s) < 3:
@@ -1135,9 +1148,19 @@ def generate_split(
     min_new_facts: int,
     case_stride: int,
     case_offset: int,
+    exclude_case_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     cases = load_jsonl(input_path)
+    exclude_case_ids = exclude_case_ids or set()
+    if exclude_case_ids:
+        before = len(cases)
+        cases = [case for case in cases if str(case.get("disease_id", "")) not in exclude_case_ids]
+        print(
+            f"[{split_name}] excluded {before - len(cases)} previously processed cases "
+            f"using exclude_case_ids_file",
+            flush=True,
+        )
     rng.shuffle(cases)
     df = symptom_df(cases)
     n_cases = len(cases)
@@ -1348,6 +1371,12 @@ def main() -> None:
     parser.add_argument("--min_new_facts", type=int, default=2)
     parser.add_argument("--case_stride", type=int, default=1)
     parser.add_argument("--case_offset", type=int, default=0)
+    parser.add_argument(
+        "--exclude_case_ids_file",
+        type=Path,
+        default=None,
+        help="Optional newline-separated disease_id list to skip before sharding.",
+    )
     args = parser.parse_args()
 
     if args.use_llm and (not args.llm_api_base or not args.llm_model):
@@ -1360,6 +1389,9 @@ def main() -> None:
         raise SystemExit("--top_k_per_case must be in [1, candidates_per_case]")
     if args.teacher_generate_questions and not args.use_llm:
         raise SystemExit("--teacher_generate_questions requires --use_llm")
+    exclude_case_ids = load_case_id_set(args.exclude_case_ids_file)
+    if args.exclude_case_ids_file:
+        print(f"[INFO] Loaded {len(exclude_case_ids)} case ids to exclude from {args.exclude_case_ids_file}")
 
     output_dir = args.output_dir
     if args.timestamp_output:
@@ -1388,6 +1420,7 @@ def main() -> None:
             min_new_facts=args.min_new_facts,
             case_stride=args.case_stride,
             case_offset=args.case_offset,
+            exclude_case_ids=exclude_case_ids,
         )
     )
     summaries.append(
@@ -1411,6 +1444,7 @@ def main() -> None:
             min_new_facts=args.min_new_facts,
             case_stride=args.case_stride,
             case_offset=args.case_offset,
+            exclude_case_ids=exclude_case_ids,
         )
     )
 
@@ -1429,6 +1463,8 @@ def main() -> None:
         "min_new_facts": args.min_new_facts,
         "case_stride": args.case_stride,
         "case_offset": args.case_offset,
+        "exclude_case_ids_file": str(args.exclude_case_ids_file) if args.exclude_case_ids_file else "",
+        "exclude_case_ids_count": len(exclude_case_ids),
         "splits": summaries,
         "notes": [
             "Doctor sees only system prompt, patient natural-language opening, and patient natural-language answers.",

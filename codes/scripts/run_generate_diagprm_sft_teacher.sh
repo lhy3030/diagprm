@@ -29,6 +29,7 @@ MIN_KG_COVERAGE="${MIN_KG_COVERAGE:-0.5}"
 MIN_NEW_FACTS="${MIN_NEW_FACTS:-2}"
 CASE_STRIDE="${CASE_STRIDE:-1}"
 CASE_OFFSET="${CASE_OFFSET:-0}"
+EXCLUDE_CASE_IDS_FILE="${EXCLUDE_CASE_IDS_FILE:-}"
 
 USE_LLM="${USE_LLM:-1}"
 TEACHER_GENERATE_QUESTIONS="${TEACHER_GENERATE_QUESTIONS:-1}"
@@ -78,6 +79,10 @@ CMD=(
   --case_offset "${CASE_OFFSET}"
 )
 
+if [ -n "${EXCLUDE_CASE_IDS_FILE}" ]; then
+  CMD+=(--exclude_case_ids_file "${EXCLUDE_CASE_IDS_FILE}")
+fi
+
 if [ "${USE_LLM}" = "1" ]; then
   CMD+=(
     --use_llm
@@ -100,6 +105,7 @@ echo "[INFO] Top-k per case:         ${TOP_K_PER_CASE}"
 echo "[INFO] Min KG coverage:        ${MIN_KG_COVERAGE}"
 echo "[INFO] Min new facts:          ${MIN_NEW_FACTS}"
 echo "[INFO] Case shard:             ${CASE_OFFSET}/${CASE_STRIDE}"
+echo "[INFO] Exclude case ids file:  ${EXCLUDE_CASE_IDS_FILE:-<none>}"
 echo "[INFO] Use LLM:                ${USE_LLM}"
 echo "[INFO] Teacher gen questions:  ${TEACHER_GENERATE_QUESTIONS}"
 echo "[INFO] vLLM mode:              ${USE_VLLM}"
