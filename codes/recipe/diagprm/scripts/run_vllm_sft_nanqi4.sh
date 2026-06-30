@@ -8,18 +8,20 @@
 #   3. Keep logs and outputs under timestamped directories.
 #
 # Usage on nanqi4:
-#   cd /home/ubuntu/liutianshuo/diagprm/codes/scripts
-#   nohup bash run_vllm_sft_nanqi4.sh > ../../diagprm_dataset/nanqi4_sft_master.log 2>&1 &
+#   cd /home/ubuntu/liutianshuo/diagprm/codes/recipe/diagprm/scripts
+#   nohup bash run_vllm_sft_nanqi4.sh \
+#     > /home/ubuntu/liutianshuo/diagprm/diagprm_dataset/nanqi4_sft_master.log 2>&1 &
 #
 # Small smoke test:
 #   MAX_TRAIN_CASES=2 MAX_VAL_CASES=1 CANDIDATES_PER_CASE=2 TOP_K_PER_CASE=1 \
-#   nohup bash run_vllm_sft_nanqi4.sh > ../../diagprm_dataset/nanqi4_sft_smoke.log 2>&1 &
+#   nohup bash run_vllm_sft_nanqi4.sh \
+#     > /home/ubuntu/liutianshuo/diagprm/diagprm_dataset/nanqi4_sft_smoke.log 2>&1 &
 # ==============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODES_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODES_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DIAGPRM_ROOT="$(cd "${CODES_DIR}/.." && pwd)"
 
 MODEL_PATH="${MODEL_PATH:-/home/ubuntu/liutianshuo/base_model/Qwen3-8B}"

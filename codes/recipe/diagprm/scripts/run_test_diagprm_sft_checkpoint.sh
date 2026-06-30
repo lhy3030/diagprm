@@ -4,7 +4,7 @@ set -euo pipefail
 # Merge a verl FSDP SFT checkpoint if needed, then run a few generation tests.
 #
 # Default remote usage:
-#   cd /home/ubuntu/liutianshuo/diagprm/codes/scripts
+#   cd /home/ubuntu/liutianshuo/diagprm/codes/recipe/diagprm/scripts
 #   bash run_test_diagprm_sft_checkpoint.sh
 #
 # Test another checkpoint/model:
@@ -13,7 +13,7 @@ set -euo pipefail
 #   bash run_test_diagprm_sft_checkpoint.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIAGPRM_ROOT="${DIAGPRM_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+DIAGPRM_ROOT="${DIAGPRM_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 CODES_DIR="${CODES_DIR:-${DIAGPRM_ROOT}/codes}"
 
 CKPT_ROOT="${CKPT_ROOT:-${DIAGPRM_ROOT}/checkpoints/Qwen3-1.7B-diagprm-sft}"

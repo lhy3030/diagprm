@@ -7,7 +7,7 @@
 #   2. Starts a fresh run_vllm_sft_nanqi4.sh with EXCLUDE_CASE_IDS_FILE set.
 #
 # Usage on nanqi4:
-#   cd /home/ubuntu/liutianshuo/diagprm/codes/scripts
+#   cd /home/ubuntu/liutianshuo/diagprm/codes/recipe/diagprm/scripts
 #   PREVIOUS_RUN_ID=20260627_145328 PREVIOUS_TIMESTAMP=20260627_145636 \
 #   MAX_TRAIN_CASES=250 MAX_VAL_CASES=0 \
 #   nohup bash run_vllm_sft_nanqi4_continue_missing.sh \
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODES_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODES_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DIAGPRM_ROOT="$(cd "${CODES_DIR}/.." && pwd)"
 
 PYTHON3="${PYTHON3:-/opt/conda/envs/diagprm/bin/python3}"

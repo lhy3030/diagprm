@@ -5,7 +5,7 @@ set -euo pipefail
 # Model is selected via MODEL_PATH (default: Qwen3-1.7B).
 #
 # Default remote usage:
-#   cd /home/ubuntu/liutianshuo/diagprm/codes/scripts
+#   cd /home/ubuntu/liutianshuo/diagprm/codes/recipe/diagprm/scripts
 #   nohup bash run_diagprm_sft_qwen3.sh \
 #     > /home/ubuntu/liutianshuo/diagprm/diagprm_dataset/diagprm_sft.log 2>&1 &
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 #   LORA_RANK=0 FSDP_STRATEGY=fsdp2 USE_REMOVE_PADDING=true bash run_diagprm_sft_qwen3.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIAGPRM_ROOT="${DIAGPRM_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+DIAGPRM_ROOT="${DIAGPRM_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 CODES_DIR="${CODES_DIR:-${DIAGPRM_ROOT}/codes}"
 
 # Mirror the CUDA/NCCL compatibility settings used by recipe/diagprm/run_diagprm.sh.

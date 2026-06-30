@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODES_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODES_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DIAGPRM_ROOT="$(cd "${CODES_DIR}/.." && pwd)"
 
 export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
