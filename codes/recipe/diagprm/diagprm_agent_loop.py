@@ -26,6 +26,7 @@ import re
 import asyncio
 import json
 import os
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -565,7 +566,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         _sem = _get_patient_sem() if not _is_local else None
         for _attempt in range(8):
             try:
-                async with (_sem if _sem else asyncio.nullcontext()):
+                async with (_sem if _sem else nullcontext()):
                     async with aiohttp.ClientSession() as session:
                         async with session.post(
                             url,
@@ -729,7 +730,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         _sem = _get_patient_sem() if not _is_local else None
         for _attempt in range(8):
             try:
-                async with (_sem if _sem else asyncio.nullcontext()):
+                async with (_sem if _sem else nullcontext()):
                     async with aiohttp.ClientSession() as session:
                         async with session.post(
                             url,

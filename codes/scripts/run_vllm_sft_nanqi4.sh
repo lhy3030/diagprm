@@ -34,6 +34,8 @@ IFS=',' read -r -a GPU_IDS <<< "${GPU_IDS_CSV}"
 NUM_WORKERS="${NUM_WORKERS:-${#GPU_IDS[@]}}"
 BASE_PORT="${BASE_PORT:-8000}"
 MAX_WAIT="${MAX_WAIT:-600}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
+CLEAR_VLLM_COMPILE_CACHE="${CLEAR_VLLM_COMPILE_CACHE:-0}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-${DIAGPRM_ROOT}/diagprm_dataset/vllm_sft_logs/${RUN_ID}}"
@@ -90,12 +92,22 @@ echo "[INFO] Output root:   ${OUTPUT_ROOT}"
 echo "[INFO] Log dir:       ${LOG_DIR}"
 echo "[INFO] Shard seed:    ${SHARD_SEED}"
 echo "[INFO] Exclude ids:   ${EXCLUDE_CASE_IDS_FILE:-<none>}"
+echo "[INFO] Enforce eager: ${VLLM_ENFORCE_EAGER}"
 echo "======================================================================"
+
+if [ "${CLEAR_VLLM_COMPILE_CACHE}" = "1" ]; then
+  echo "[INFO] Clearing vLLM torch compile cache..."
+  rm -rf "${HOME}/.cache/vllm/torch_compile_cache"
+fi
 
 for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
   gpu_id="${GPU_IDS[$worker_id]}"
   port=$((BASE_PORT + worker_id))
   log_file="${LOG_DIR}/vllm_gpu${gpu_id}_port${port}.log"
+  vllm_extra_args=()
+  if [ "${VLLM_ENFORCE_EAGER}" = "1" ]; then
+    vllm_extra_args+=(--enforce-eager)
+  fi
 
   echo "[INFO] Starting vLLM worker=${worker_id} gpu=${gpu_id} port=${port}"
   CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON3}" -m vllm.entrypoints.openai.api_server \
@@ -107,6 +119,7 @@ for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
     --dtype auto \
     --trust-remote-code \
     --served-model-name "${MODEL_NAME}" \
+    "${vllm_extra_args[@]}" \
     > "${log_file}" 2>&1 &
   VLLM_PIDS+=("$!")
 done
@@ -120,9 +133,18 @@ for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
       echo "[INFO] vLLM worker=${worker_id} ready after ${waited}s"
       break
     fi
+    vllm_pid="${VLLM_PIDS[$worker_id]}"
+    if ! kill -0 "${vllm_pid}" 2>/dev/null; then
+      echo "[ERROR] vLLM worker=${worker_id} process exited before becoming ready"
+      echo "[ERROR] Last 120 lines of ${LOG_DIR}/vllm_*_port${port}.log:"
+      tail -120 "${LOG_DIR}"/vllm_*_port"${port}".log 2>/dev/null || true
+      exit 1
+    fi
     if [ "${waited}" -ge "${MAX_WAIT}" ]; then
       echo "[ERROR] vLLM worker=${worker_id} not ready after ${MAX_WAIT}s"
       echo "[ERROR] Check ${LOG_DIR}/vllm_*_port${port}.log"
+      echo "[ERROR] Last 120 lines of ${LOG_DIR}/vllm_*_port${port}.log:"
+      tail -120 "${LOG_DIR}"/vllm_*_port"${port}".log 2>/dev/null || true
       exit 1
     fi
     sleep 5

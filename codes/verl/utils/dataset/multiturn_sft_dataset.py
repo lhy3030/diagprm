@@ -59,6 +59,7 @@ class MultiTurnSFTDataset(Dataset):
         self.tools_key = multiturn_config.get("tools_key", "tools")
         self.enable_thinking_key = multiturn_config.get("enable_thinking_key", "enable_thinking")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self._token_mismatch_warning_count = 0
         assert self.truncation in ["error", "left", "right"]
 
         if not isinstance(parquet_files, list | ListConfig):
@@ -210,12 +211,16 @@ class MultiTurnSFTDataset(Dataset):
         if len(concat_tokens) != len(full_tokens_list) or not all(
             a == b for a, b in zip(concat_tokens, full_tokens_list, strict=True)
         ):
-            logging.warning(
-                f"Token mismatch detected! Full tokenization length: {len(full_tokens_list)}, Concatenated tokens "
-                f"length: {len(concat_tokens)}. Using concatenated version."
-                # f"full tokens text: {self.tokenizer.decode(full_tokens_list)}"
-                # f"concat tokens text: {self.tokenizer.decode(concat_tokens)}"
-            )
+            if self._token_mismatch_warning_count < 5:
+                logging.warning(
+                    f"Token mismatch detected! Full tokenization length: {len(full_tokens_list)}, Concatenated tokens "
+                    f"length: {len(concat_tokens)}. Using concatenated version."
+                    # f"full tokens text: {self.tokenizer.decode(full_tokens_list)}"
+                    # f"concat tokens text: {self.tokenizer.decode(concat_tokens)}"
+                )
+            elif self._token_mismatch_warning_count == 5:
+                logging.warning("Additional token mismatch warnings suppressed for this dataset worker.")
+            self._token_mismatch_warning_count += 1
             return (
                 torch.tensor(concat_tokens, dtype=torch.long),
                 torch.tensor(concat_loss_mask, dtype=torch.long),
