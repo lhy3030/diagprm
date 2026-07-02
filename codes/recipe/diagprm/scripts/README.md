@@ -8,6 +8,11 @@ augmentation utilities live here. Generic verl utilities remain in `codes/script
 - `build_common_disease_augments_from_med_sources.py`: mine common-disease fact candidates from local MEDIQ/MedQA/MedicalExam/MedMCQA/PrimeKG sources.
 - `curate_common_disease_augments_from_qa.py`: normalize QA-mined case facts into disease-level patient-observable augment facts.
 - `build_common_disease_augmented_kg.py`: build a new augmented DiagPRM dataset directory from `clean_v2` and an augment JSON.
+- `build_common_disease_rl_dataset.py`: build a common-disease-only RL dataset with multiple chief-complaint scenarios per disease.
+
+## RL Runs
+
+- `run_diagprm_common_rl.sh`: run DiagPRM RL on the common-disease-only dataset with shorter dialogues and stronger final-diagnosis pressure.
 
 ## SFT Data
 

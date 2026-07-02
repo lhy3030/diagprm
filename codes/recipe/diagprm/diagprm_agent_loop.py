@@ -841,7 +841,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         hypothesis = parsed.get("hypothesis") or None
         if hypothesis:
             hypothesis = str(hypothesis).strip()
-        raw_action = parsed.get("action", "").strip().lower()
+        raw_action = self._normalize_action_value(parsed.get("action", ""))
         if raw_action in ("ask", "continue", "switch"):
             action = "ask"
         elif raw_action == "diagnose":
@@ -943,7 +943,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
         动作空间： ask / diagnose（将旧的 continue/switch 平滑合并为 ask）
         """
         parsed = self._parse_doctor_json(doctor_response)
-        raw = parsed.get("action", "").strip().lower()
+        raw = self._normalize_action_value(parsed.get("action", ""))
         if raw in ("ask", "continue", "switch"):
             return "ask"
         if raw == "diagnose":
@@ -958,6 +958,31 @@ class DiagPRMAgentLoop(AgentLoopBase):
             raw2 = match.group(1).strip().lower()
             return "ask" if raw2 in ("ask", "continue", "switch") else raw2
         return None
+
+    def _normalize_action_value(self, value: Any) -> str:
+        """Normalize potentially malformed doctor action values.
+
+        During RL, the actor may occasionally emit malformed JSON such as
+        {"action": {"type": "ask"}}. Treat these as parseable when possible
+        and invalid otherwise, instead of crashing the rollout worker.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip().lower()
+        if isinstance(value, dict):
+            for key in ("action", "type", "name", "value"):
+                nested = self._normalize_action_value(value.get(key))
+                if nested:
+                    return nested
+            return ""
+        if isinstance(value, list):
+            for item in value:
+                nested = self._normalize_action_value(item)
+                if nested:
+                    return nested
+            return ""
+        return str(value).strip().lower()
 
     def _parse_question(self, doctor_response: str) -> Optional[str]:
         """从 doctor 回复中解析 question 字段（JSON 格式）。"""

@@ -75,17 +75,29 @@ _MODEL_TAG="$(basename "${MODEL_PATH}")"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 NNODES="${NNODES:-1}"
 
-EXP_NAME="${EXP_NAME:-${_MODEL_TAG}-diagprm-sft}"
+_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${EXP_NAME:-${_MODEL_TAG}_diagprm_sft_${_TIMESTAMP}}"
 PROJECT_NAME="${PROJECT_NAME:-diagprm-sft}"
 SAVE_DIR="${SAVE_DIR:-${DIAGPRM_ROOT}/checkpoints/${EXP_NAME}}"
 
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 LR="${LR:-1e-5}"
-SAVE_FREQ="${SAVE_FREQ:-100}"
+# Auto-compute SAVE_FREQ as steps-per-epoch so checkpoint is saved once per epoch.
+# Falls back to 100 if the parquet file is unreadable (e.g. missing dependency).
+if [ -z "${SAVE_FREQ:-}" ]; then
+  _N_SAMPLES="$(python3 -c "import pandas as pd; print(len(pd.read_parquet('${TRAIN_FILE}')))" 2>/dev/null || echo "")"
+  if [ -n "${_N_SAMPLES}" ] && [ "${_N_SAMPLES}" -gt 0 ] 2>/dev/null; then
+    SAVE_FREQ=$(( (_N_SAMPLES + TRAIN_BATCH_SIZE - 1) / TRAIN_BATCH_SIZE ))
+    echo "[INFO] Auto SAVE_FREQ=${SAVE_FREQ} (${_N_SAMPLES} samples / batch ${TRAIN_BATCH_SIZE} = 1 ckpt/epoch)"
+  else
+    SAVE_FREQ=100
+    echo "[WARN] Could not read TRAIN_FILE for auto SAVE_FREQ, using default ${SAVE_FREQ}"
+  fi
+fi
 TEST_FREQ="${TEST_FREQ:--1}"
 LOGGER="${LOGGER:-console}"
 TRUNCATION="${TRUNCATION:-error}"

@@ -183,7 +183,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # ── 对话超参 ──────────────────────────────────────────────────────────────────
-max_turns=10           # 最大问诊轮数
+max_turns=${MAX_TURNS_OVERRIDE:-10}  # 最大问诊轮数
 max_prompt_length=1024
 max_response_length=4096  # 单轮 response 上限；多轮对话每轮约 300-600 token，4096 避免截断
 actor_lr=1e-6
@@ -212,16 +212,18 @@ log_prob_max_token_len_per_gpu=${actor_max_token_len_per_gpu}
 #   r_diag(k) = 确诊奖励（仅最后轮）
 beta=1.0         # KG 覆盖率差分系数（r_turn 内部）
 turn_coef=1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
-r_max=2.0        # 最大确诊奖励
-tau=0.5          # 过早确诊阈值
-min_new_facts_for_diagnosis=2  # 正确诊断拿满分前至少需要新增确认事实数
-r_premature_diag=0.0           # 正确但证据不足/过早诊断的最终奖励
+r_max=${R_MAX_OVERRIDE:-2.0}        # 最大确诊奖励
+tau=${TAU_OVERRIDE:-0.5}            # 过早确诊阈值
+min_new_facts_for_diagnosis=${MIN_NEW_FACTS_FOR_DIAGNOSIS_OVERRIDE:-2}  # 正确诊断拿满分前至少需要新增确认事实数
+r_premature_diag=${R_PREMATURE_DIAG_OVERRIDE:-0.0}  # 正确但证据不足/过早诊断的最终奖励
+r_wrong_diag=${R_WRONG_DIAG_OVERRIDE:--1.0}
+r_timeout=${R_TIMEOUT_OVERRIDE:--1.0}
 
 # ── GiGPO 混合系数 ─────────────────────────────────────────────────────────────
 # Â(k) = Â_turn(k) + alpha * Â_diag
 #   alpha=0 → 纯 turn 级归一化（无轨迹级信号）
 #   alpha=1 → turn 级 + 等权轨迹级混合
-alpha=0.5
+alpha=${ALPHA_OVERRIDE:-0.5}
 
 echo "============================================================"
 echo "  DiagPRM Training"
@@ -305,6 +307,8 @@ python3 -m recipe.diagprm.diagprm_main \
     reward_coefficients.tau=${tau} \
     reward_coefficients.min_new_facts_for_diagnosis=${min_new_facts_for_diagnosis} \
     reward_coefficients.r_premature_diag=${r_premature_diag} \
+    reward_coefficients.r_wrong_diag=${r_wrong_diag} \
+    reward_coefficients.r_timeout=${r_timeout} \
     reward_coefficients.weighted=True \
     \
     algorithm.diagprm_alpha=${alpha} \
