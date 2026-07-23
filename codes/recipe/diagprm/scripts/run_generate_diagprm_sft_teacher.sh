@@ -9,6 +9,15 @@ DIAGPRM_ROOT="$(cd "${CODES_DIR}/.." && pwd)"
 export PYTHONPATH="${CODES_DIR}:${PYTHONPATH:-}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/private/tmp}"
 
+# Use diagprm conda env python if available (has pandas, vllm deps), else fallback
+if [ -x "/opt/conda/envs/diagprm/bin/python3" ]; then
+  PYTHON3="/opt/conda/envs/diagprm/bin/python3"
+elif [ -x "${HOME}/miniconda3/envs/diagprm/bin/python3" ]; then
+  PYTHON3="${HOME}/miniconda3/envs/diagprm/bin/python3"
+else
+  PYTHON3="python3"
+fi
+
 # ============================================================================
 # Config — 所有变量均可通过环境变量覆盖，例如：
 #   MAX_TRAIN_CASES=1 OUTPUT_BASE_DIR=/tmp/test bash run_generate_diagprm_sft_teacher.sh
@@ -34,6 +43,18 @@ EXCLUDE_CASE_IDS_FILE="${EXCLUDE_CASE_IDS_FILE:-}"
 USE_LLM="${USE_LLM:-1}"
 TEACHER_GENERATE_QUESTIONS="${TEACHER_GENERATE_QUESTIONS:-1}"
 
+# Optional: start a single local vLLM server as the teacher/patient LLM.
+# This is useful for smoke tests or one-process SFT collection. For large
+# four-worker collection, keep using run_vllm_sft_nanqi4.sh.
+if [ "${START_PATIENT_VLLM:-0}" = "1" ]; then
+  source "${SCRIPT_DIR}/patient_vllm_utils.sh"
+  start_patient_vllm_if_requested
+  trap stop_patient_vllm EXIT
+  USE_VLLM=1
+  VLLM_HOST="${PATIENT_VLLM_HOST:-127.0.0.1}"
+  VLLM_PORT="${PATIENT_VLLM_PORT:-8100}"
+fi
+
 # vLLM mode: set USE_VLLM=1 to use local vLLM server instead of remote API
 # vLLM server should be started separately before running this script.
 # Example: vllm serve /path/to/Qwen3-8B --port 8000 --tensor-parallel-size 2
@@ -44,20 +65,11 @@ if [ "${USE_VLLM}" = "1" ]; then
   VLLM_PORT="${VLLM_PORT:-8000}"
   LLM_API_BASE="${LLM_API_BASE:-http://${VLLM_HOST}:${VLLM_PORT}/v1}"
   LLM_API_KEY="${LLM_API_KEY:-EMPTY}"  # vLLM doesn't require a real key
-  LLM_MODEL="${LLM_MODEL:-Qwen3-8B}"
+  LLM_MODEL="${LLM_MODEL:-${PATIENT_MODEL:-Qwen3-8B}}"
 else
   LLM_API_BASE="${LLM_API_BASE:-https://aigc.sankuai.com/v1/openai/native}"
   LLM_API_KEY="${LLM_API_KEY:-}"  # 通过环境变量传入，避免硬编码
   LLM_MODEL="${LLM_MODEL:-qwen3-32b-meituan}"
-fi
-
-# Use diagprm conda env python if available (has pandas, vllm deps), else fallback
-if [ -x "/opt/conda/envs/diagprm/bin/python3" ]; then
-  PYTHON3="/opt/conda/envs/diagprm/bin/python3"
-elif [ -x "${HOME}/miniconda3/envs/diagprm/bin/python3" ]; then
-  PYTHON3="${HOME}/miniconda3/envs/diagprm/bin/python3"
-else
-  PYTHON3="python3"
 fi
 
 CMD=(

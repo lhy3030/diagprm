@@ -42,6 +42,19 @@ def _get_patient_sem() -> asyncio.Semaphore:
         _PATIENT_API_SEM = asyncio.Semaphore(limit)
     return _PATIENT_API_SEM
 
+
+def _strip_thinking_text(text: str) -> str:
+    """Remove Qwen-style thinking traces from patient simulator outputs."""
+    if not text:
+        return ""
+    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    lower = cleaned.lower()
+    if "</think>" in lower:
+        cleaned = cleaned[lower.rfind("</think>") + len("</think>"):]
+    elif "<think>" in lower:
+        cleaned = cleaned[:lower.find("<think>")]
+    return cleaned.strip()
+
 from recipe.atpo.agent_loop import AgentLoopBase, AgentLoopOutput, AgentLoopMetrics
 from recipe.atpo.chat_model import ChatModel, MaxTokenExceededError
 from recipe.diagprm.kg_utils import (
@@ -53,6 +66,7 @@ from recipe.diagprm.kg_utils import (
 from recipe.diagprm.prompts import (
     DOCTOR_SYSTEM_PROMPT,
     DOCTOR_SYSTEM_PROMPT_NO_KG,
+    DOCTOR_FINAL_DIAGNOSIS_PROMPT,
     PATIENT_SYSTEM_PROMPT,
     PATIENT_OPENING_PROMPT,
 )
@@ -79,15 +93,20 @@ class DiagPRMAgentLoop(AgentLoopBase):
                             (default: PATIENT_API_BASE env var, or "http://localhost:8001/v1")
       patient_model       : model name for the patient simulator
                             (default: PATIENT_MODEL env var, or "gpt-4o-mini")
-      patient_max_tokens  : max tokens for patient responses (default: 256)
+      patient_max_tokens  : max tokens for patient responses (default: 512)
       kg_tool_enabled     : whether Doctor can observe KG query feedback (default: False)
       kg_path             : path to master_kg.json (for KG query tool; falls back to
                             reward_model.kg_path in trainer config if not provided)
+      force_diagnose_on_last_turn : force final turn to diagnose and retry once
+                                    if the model still asks (default: True)
     """
 
     def __init__(self, trainer_config, server_manager, tokenizer, processor, **kwargs):
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
-        self.max_turns = kwargs.get("max_turns", 10)
+        self.max_turns = int(
+            os.environ.get("MAX_TURNS_OVERRIDE")
+            or kwargs.get("max_turns", 10)
+        )
         self.verifier_enabled = kwargs.get("verifier_enabled", True)
         # Patient LLM API config
         # 优先级：环境变量 > yaml/kwargs > 默认值
@@ -100,10 +119,17 @@ class DiagPRMAgentLoop(AgentLoopBase):
             os.environ.get("PATIENT_MODEL")
             or kwargs.get("patient_model", "gpt-4o-mini")
         )
-        self.patient_max_tokens = kwargs.get("patient_max_tokens", 256)
+        self.patient_max_tokens = int(
+            os.environ.get("PATIENT_MAX_TOKENS")
+            or kwargs.get("patient_max_tokens", 512)
+        )
         # 是否开启思考模式（内部模型如 qwen3.5-plus 支持 enable_thinking 关闭，节省 token）
         self.patient_enable_thinking = bool(kwargs.get("patient_enable_thinking", False))
         self.kg_tool_enabled = bool(kwargs.get("kg_tool_enabled", False))
+        self.force_diagnose_on_last_turn = (
+            os.environ.get("FORCE_DIAGNOSE_ON_LAST_TURN", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
         self.doctor_system_prompt = (
             DOCTOR_SYSTEM_PROMPT if self.kg_tool_enabled else DOCTOR_SYSTEM_PROMPT_NO_KG
         )
@@ -235,7 +261,12 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
                 # ── 每轮更新 system prompt 中的 current_turn ─────────────────
                 # 替换 messages[0]，使模型始终知道当前是第几轮
-                messages[0] = SystemMessage(content=self.doctor_system_prompt.format(
+                prompt_template = (
+                    DOCTOR_FINAL_DIAGNOSIS_PROMPT
+                    if is_last_turn and self.force_diagnose_on_last_turn
+                    else self.doctor_system_prompt
+                )
+                messages[0] = SystemMessage(content=prompt_template.format(
                     max_turns=self.max_turns,
                     current_turn=turn_count,
                 ))
@@ -260,6 +291,39 @@ class DiagPRMAgentLoop(AgentLoopBase):
 
                 # ── 解析 action ────────────────────────────────────────────────
                 action = self._parse_action(doctor_response)
+
+                # Last-turn hard constraint: ask is not a valid final action.
+                # We retry once with an explicit correction instead of rewriting
+                # the action, so the recorded trajectory is still model-generated.
+                if (
+                    is_last_turn
+                    and self.force_diagnose_on_last_turn
+                    and action != "diagnose"
+                ):
+                    retry_messages = list(messages)
+                    retry_messages.append(HumanMessage(
+                        content=(
+                            "[System] This is the final turn. Your previous output was not a diagnosis. "
+                            "You must output exactly one JSON object with "
+                            '{"action":"diagnose","diagnosis":"<best diagnosis>"}. '
+                            "Do not ask another question."
+                        )
+                    ))
+                    try:
+                        retry_result = await model.ainvoke(
+                            retry_messages,
+                            sampling_params=sampling_params,
+                        )
+                        retry_response = retry_result.content
+                        retry_action = self._parse_action(retry_response)
+                        if retry_response is not None and retry_action == "diagnose":
+                            result = retry_result
+                            doctor_response = retry_response
+                            action = retry_action
+                    except MaxTokenExceededError:
+                        break
+                    except Exception as e:
+                        print(f"[DiagPRMAgentLoop] Doctor final-diagnosis retry error: {e}")
 
                 # ── 将 doctor 回复追加到对话历史 ─────────────────────────────
                 # 必须保留 ChatModel 写入的 response_metadata，后续轮次会基于
@@ -577,7 +641,9 @@ class DiagPRMAgentLoop(AgentLoopBase):
                         ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                return data["choices"][0]["message"]["content"].strip()
+                                _msg = data["choices"][0]["message"]
+                                _raw = _strip_thinking_text(_msg.get("content") or "")
+                                return _raw
                             elif resp.status == 429:
                                 wait = min(2 ** _attempt, 60)
                                 text = await resp.text()
@@ -710,7 +776,7 @@ class DiagPRMAgentLoop(AgentLoopBase):
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": "Please introduce yourself to the doctor now."},
             ],
-            "max_tokens": 128,
+            "max_tokens": self.patient_max_tokens,
             "temperature": 0.7,
             "stream": False,
         }
@@ -741,7 +807,8 @@ class DiagPRMAgentLoop(AgentLoopBase):
                         ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                opening = data["choices"][0]["message"]["content"].strip()
+                                _msg = data["choices"][0]["message"]
+                                opening = _strip_thinking_text(_msg.get("content") or "")
                                 if opening:
                                     return opening
                             elif resp.status == 429:

@@ -60,12 +60,16 @@ reward_model:
 # ── DiagPRM 奖励系数 ──────────────────────────────────────────────────────────
 reward_coefficients:
   beta: 1.0         # KG 覆盖率差分系数
-  turn_coef: 1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
-  r_max: 2.0        # 最大确诊奖励
+  turn_coef: 0.4    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
+  r_max: 1.0        # 正确诊断奖励
   tau: 0.5          # 过早确诊 KG 覆盖率阈值
   min_new_facts_for_diagnosis: 2
+  # Kept for backward compatibility; correct-but-premature now receives r_max
+  # and premature_diag_rate is logged only as an analysis metric.
   r_premature_diag: 0.0
-  weighted: true    # 是否使用加权 KG 覆盖率
+  r_wrong_diag: 0.0
+  r_timeout: -2.0
+  weighted: false   # 是否使用加权 KG 覆盖率；默认 unweighted 更易解释
 
 # ── Algorithm（Turn-level GRPO，无 Critic）────────────────────────────────────
 algorithm:
@@ -78,9 +82,14 @@ algorithm:
   adv_estimator: diagprm_grpo
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
-  # GiGPO 混合系数：Â(k) = Â_turn(k) + alpha * Â_diag
-  # alpha=0 → 纯 turn 级；alpha=1 → turn 级 + 等权轨迹级
+  # GiGPO-style mixing coefficient. Kept as diagprm_alpha for backward
+  # compatibility, but semantically this is omega in:
+  #   A(k) = A_diag + omega * A_turn(k)
+  # omega=0 → outcome-only trajectory signal; omega=0.5 → KG turn shaping.
   diagprm_alpha: 0.5
+  # Diagnose turn is the terminal decision and receives a stronger outcome
+  # advantage: A_diagnose = terminal_diag_coef * A_diag.
+  terminal_diag_coef: 1.2
   kl_penalty: kl
   kl_ctrl:
     _target_: verl.trainer.config.KLControlConfig

@@ -59,6 +59,9 @@ def load_diagprm_reward_manager(config, tokenizer, num_examine, **reward_kwargs)
     if reward_manager_name == "diagprm":
         from recipe.diagprm.diagprm_reward_manager import DiagPRMRewardManager
         reward_manager_cls = DiagPRMRewardManager
+    elif reward_manager_name == "atomic_fact":
+        from recipe.diagprm.atomic_fact_reward_manager import AtomicFactRewardManager
+        reward_manager_cls = AtomicFactRewardManager
     elif reward_manager_name == "mt_reward_manager":
         # 兼容 ATPO 的 reward manager
         from recipe.atpo.mt_reward_manager import MultiTurnRewardManager
@@ -85,13 +88,15 @@ def load_diagprm_reward_manager(config, tokenizer, num_examine, **reward_kwargs)
         else:
             print("[DiagPRM] WARNING: kg_path not set and default path not found!")
 
-    return reward_manager_cls(
+    kwargs = dict(
         tokenizer=tokenizer,
         num_examine=num_examine,
-        kg_path=kg_path,
         reward_coefficients=reward_coefficients,
         **reward_kwargs,
     )
+    if reward_manager_name == "diagprm":
+        kwargs["kg_path"] = kg_path
+    return reward_manager_cls(**kwargs)
 
 
 @hydra.main(config_path="config", config_name="diagprm_trainer", version_base=None)

@@ -350,7 +350,12 @@ class AsyncvLLMServer(AsyncServerBase):
         request_id: str,
         image_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
-        max_tokens = self.max_model_len - len(prompt_ids)
+        remaining_tokens = self.max_model_len - len(prompt_ids)
+        requested_max_tokens = sampling_params.pop("max_tokens", None)
+        if requested_max_tokens is None:
+            max_tokens = remaining_tokens
+        else:
+            max_tokens = min(int(requested_max_tokens), remaining_tokens)
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.processor)

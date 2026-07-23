@@ -41,10 +41,13 @@ def compute_advantage(
     其余 estimator 类型代理给 ATPO 的原始实现。
     """
     if adv_estimator == DIAGPRM_GRPO or str(adv_estimator) == DIAGPRM_GRPO:
-        # 从 config 中读取 GiGPO 混合系数 alpha（默认 0.5）
+        # 从 config 中读取 GiGPO omega（旧配置名 diagprm_alpha）。
+        # 语义：A = A_diag + omega * A_turn，诊断正确性为主信号。
         alpha = 0.5
+        terminal_diag_coef = 1.2
         if config is not None:
             alpha = getattr(config, "diagprm_alpha", 0.5)
+            terminal_diag_coef = getattr(config, "terminal_diag_coef", 1.2)
         advantages, returns = compute_diagprm_turn_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
@@ -52,6 +55,7 @@ def compute_advantage(
             norm_adv_by_std=norm_adv_by_std_in_grpo,
             adv_compute_info=data.non_tensor_batch.get("adv_compute_info", None),
             alpha=alpha,
+            terminal_diag_coef=terminal_diag_coef,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -126,6 +130,13 @@ def _diagprm_compute_accuracy_metrics(batch):
         "diagprm/valid_format_rate": _safe_mean('valid_format_rate'),
         "diagprm/premature_diag_rate": _safe_mean('premature_diag_rate'),
         "diagprm/delta_kg_sum_mean": _safe_mean('delta_kg_sum'),
+        # AtomicFact-RL metrics. These are zero for KG-diagnosis runs.
+        "atomic_fact/answer_rate": _safe_mean('answer_rate'),
+        "atomic_fact/fact_coverage": _safe_mean('fact_coverage'),
+        "atomic_fact/delta_fact_sum": _safe_mean('delta_fact_sum'),
+        "atomic_fact/no_eos_rate": _safe_mean('no_eos_rate'),
+        "atomic_fact/unknown_fact_rate": _safe_mean('unknown_fact_rate'),
+        "atomic_fact/duplicate_fact_rate": _safe_mean('duplicate_fact_rate'),
     }
 
 

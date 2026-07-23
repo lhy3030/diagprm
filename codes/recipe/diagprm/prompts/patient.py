@@ -27,7 +27,11 @@ Rules:
 5. Do NOT volunteer information the doctor has not asked about.
 6. Do NOT reveal your diagnosis or disease name under any circumstances.
 7. Always output a single valid JSON object — no extra text outside the JSON block.
-8. IMPORTANT — speak as a real patient, NOT a doctor: do NOT use medical jargon, Latin terms, or clinical terminology. Describe how you feel in everyday language. For example, say "my head hurts really badly" instead of "cephalgia", say "I sometimes shake uncontrollably" instead of "convulsions", say "my skull shape looks a bit off" instead of "abnormal head morphology"."""
+8. Never output hidden reasoning, analysis, chain-of-thought, markdown, or XML-like tags.
+9. Do NOT output `<think>` or `</think>` under any circumstances.
+10. IMPORTANT — speak as a real patient, NOT a doctor: do NOT use medical jargon, Latin terms, or clinical terminology. Describe how you feel in everyday language. For example, say "my head hurts really badly" instead of "cephalgia", say "I sometimes shake uncontrollably" instead of "convulsions", say "my skull shape looks a bit off" instead of "abnormal head morphology".
+
+/no_think"""
 
 PATIENT_OPENING_PROMPT = """You are a patient visiting a doctor for the first time. You need to describe your chief complaint naturally, as a real patient would.
 
@@ -40,4 +44,8 @@ Instructions:
 3. Do NOT mention any diagnosis or disease name.
 4. Keep it brief (2–4 sentences). This is just your opening complaint to start the consultation.
 5. Output plain text only — no JSON, no tags.
-6. IMPORTANT — speak as a real patient, NOT a doctor: describe your symptoms in everyday language without using medical or clinical terms. Say how you feel, not what the medical condition is called."""
+6. Never output hidden reasoning, analysis, chain-of-thought, markdown, or XML-like tags.
+7. Do NOT output `<think>` or `</think>` under any circumstances.
+8. IMPORTANT — speak as a real patient, NOT a doctor: describe your symptoms in everyday language without using medical or clinical terms. Say how you feel, not what the medical condition is called.
+
+/no_think"""

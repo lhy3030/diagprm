@@ -8,7 +8,7 @@ DiagPRM - Multi-Turn Reward Manager
 奖励分配策略：
   - process_reward：放在该轮 end_position（密集信号）
   - outcome_reward：放在 final_turn end_position（稀疏信号）
-  - adv_compute_info：传递给 compute_grpo_turn_advantage 使用
+  - adv_compute_info：传递给 compute_diagprm_turn_advantage 使用
 """
 
 import json
@@ -57,13 +57,15 @@ class DiagPRMRewardManager(AbstractRewardManager):
         self.reward_params = {
             "beta": 1.0,        # KG 覆盖率差分系数
             "turn_coef": 1.0,   # Turn 奖励总系数：r(k) = turn_coef * r_turn + r_diag
-            "r_max": 2.0,       # 最大确诊奖励
+            "r_max": 1.0,       # 正确诊断奖励
             "tau": 0.5,         # 过早确诊 KG 覆盖率阈值
             "weighted": True,
             "min_new_facts_for_diagnosis": 2,
+            # Kept for backward-compatible configs; correct-but-premature now
+            # receives r_max and is logged only as an analysis metric.
             "r_premature_diag": 0.0,
-            "r_wrong_diag": -1.0,
-            "r_timeout": -1.0,
+            "r_wrong_diag": 0.0,
+            "r_timeout": -2.0,
         }
         if reward_coefficients:
             self.reward_params.update(reward_coefficients)
@@ -195,6 +197,8 @@ class DiagPRMRewardManager(AbstractRewardManager):
                     reward_extra_info["adv_compute_info"].append({
                         "turn_end_positions": [],
                         "turn_process_rewards": [],
+                        "turn_delta_kg_rewards": [],
+                        "turn_actions": [],
                         "outcome_reward": 0.0,
                     })
                     reward_extra_info["diagprm_trajectory"].append(
@@ -248,6 +252,8 @@ class DiagPRMRewardManager(AbstractRewardManager):
                 reward_extra_info["adv_compute_info"].append({
                     "turn_end_positions": [_last_pos] if (_has_history_rewards and _last_pos >= 0) else [],
                     "turn_process_rewards": [_aggregate_reward] if (_has_history_rewards and _last_pos >= 0) else [],
+                    "turn_delta_kg_rewards": [sum(float(d.get("delta_kg", 0.0)) for d in _details)] if (_has_history_rewards and _last_pos >= 0) else [],
+                    "turn_actions": [str((_details[-1].get("action") if _details else "") or "")] if (_has_history_rewards and _last_pos >= 0) else [],
                     "outcome_reward": _final_r_diag,
                 })
                 reward_extra_info["diagprm_trajectory"].append(
@@ -281,6 +287,12 @@ class DiagPRMRewardManager(AbstractRewardManager):
             r_turn_list = [
                 d.get("r_turn", 0.0) for d in details_list
             ]
+            turn_delta_kg_rewards = [
+                float(d.get("delta_kg", 0.0)) for d in details_list
+            ]
+            turn_actions = [
+                str(d.get("action", "") or "").lower() for d in details_list
+            ]
             reward_extra_info["turn_count"].append(len(turns_info))
             reward_extra_info["total_reward_sum"].append(total_reward_sum)
             reward_extra_info["total_reward_mean"].append(
@@ -297,6 +309,8 @@ class DiagPRMRewardManager(AbstractRewardManager):
             reward_extra_info["adv_compute_info"].append({
                 "turn_end_positions": turn_end_positions,
                 "turn_process_rewards": total_rewards,  # r(k) = turn_coef*r_turn + r_diag
+                "turn_delta_kg_rewards": turn_delta_kg_rewards,  # raw Delta_KG for normalized turn advantage
+                "turn_actions": turn_actions,  # A_turn is only applied to ask turns
                 "outcome_reward": final_r_diag,
             })
             reward_extra_info["diagprm_trajectory"].append(

@@ -21,6 +21,7 @@ from recipe.diagprm.kg_utils import (
     compute_kg_coverage_delta,
     extract_symptoms_from_text,
     is_diagnosis_match,
+    is_single_diagnosis_candidate,
     parse_final_diagnosis,
     parse_hypothesis_state,
     parse_question,
@@ -122,13 +123,12 @@ def calculate_turn_reward(
     # ---------- 奖励系数 ----------
     beta: float = 1.0,        # KG 覆盖率差分系数
     turn_coef: float = 1.0,   # Turn 奖励总系数（r_turn 乘以该系数后加 r_diag）
-    r_max: float = 2.0,       # 最大确诊奖励
+    r_max: float = 1.0,       # 正确诊断奖励
     tau: float = 0.5,         # 最低 KG 覆盖率阈值（过早确诊惩罚）
     weighted: bool = True,
     min_new_facts_for_diagnosis: int = 2,
-    r_premature_diag: float = 0.0,
-    r_wrong_diag: float = -1.0,
-    r_timeout: float = -1.0,
+    r_wrong_diag: float = 0.0,
+    r_timeout: float = -2.0,
 ) -> Dict:
     """
     计算单轮的完整 DiagPRM reward。
@@ -141,8 +141,7 @@ def calculate_turn_reward(
           - Δ_k^kg        : KG 覆盖率差分（本轮症状收集的增量贡献）
 
         r_diag(k) : 确诊奖励（仅 is_final_turn 时非零）
-          - 正确诊断且证据充分 : +r_max
-          - 正确诊断但证据不足 : r_premature_diag
+          - 诊断正确              : +r_max
           - 诊断错误              : r_wrong_diag
           - 超时未确诊            : r_timeout
 
@@ -208,17 +207,18 @@ def calculate_turn_reward(
     r_diag = 0.0
     if is_final_turn:
         if action == "diagnose":
-            predicted = parse_final_diagnosis(model_response)
-            if predicted is not None and is_diagnosis_match(predicted, gt_norm, kg):
+            predicted_raw = parse_final_diagnosis(model_response, normalize=False)
+            details["diagnosis_raw"] = predicted_raw or ""
+            details["strict_single_diagnosis"] = bool(
+                predicted_raw and is_single_diagnosis_candidate(predicted_raw, kg)
+            )
+            if predicted_raw is not None and is_diagnosis_match(predicted_raw, gt_norm, kg, strict_single=True):
                 n_new = max(len(curr_collected_symptoms) - n_initial_symptoms, 0)
                 evidence_ok = cov_after >= tau and n_new >= min_new_facts_for_diagnosis
-                if evidence_ok:
-                    r_diag = r_max
-                    details["is_correct_diagnosis"] = True
-                else:
-                    # 正确诊断但证据不足：不鼓励根据初始主诉直接猜病。
-                    r_diag = r_premature_diag
-                    details["is_correct_diagnosis"] = True
+                r_diag = r_max
+                details["is_correct_diagnosis"] = True
+                if not evidence_ok:
+                    # 只作为分析指标，不再改变 correct reward。
                     details["premature_diagnosis"] = True
             else:
                 # 错误诊断
@@ -340,6 +340,7 @@ def compute_episode_rewards_from_history(
             "gamma1",
             "evidence_gated_hyp",
             "wrong_hyp_penalty_scale",
+            "r_premature_diag",
         }
     }
 
@@ -492,6 +493,7 @@ def compute_episode_rewards(
                 "gamma1",
                 "evidence_gated_hyp",
                 "wrong_hyp_penalty_scale",
+                "r_premature_diag",
             }
         }
         turn_result = calculate_turn_reward(

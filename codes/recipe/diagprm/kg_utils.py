@@ -254,7 +254,16 @@ def parse_hypothesis_state(model_output: str) -> Tuple[Optional[str], Optional[s
     return primary, action
 
 
-def parse_final_diagnosis(model_output: str) -> Optional[str]:
+def _clean_diagnosis_text(text: str) -> str:
+    """Normalize whitespace/punctuation while preserving the raw diagnosis phrase."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(" \t\n\r`\"'")
+
+
+def parse_final_diagnosis(model_output: str, normalize: bool = True) -> Optional[str]:
     """
     解析最终诊断。
     优先从 JSON 格式读取 "diagnosis" 字段；
@@ -271,9 +280,9 @@ def parse_final_diagnosis(model_output: str) -> Optional[str]:
     if parsed:
         diag = parsed.get("diagnosis") or (parsed.get("hypothesis") if parsed.get("action", "").lower() == "diagnose" else None)
         if diag:
-            diag_str = str(diag).strip()
+            diag_str = _clean_diagnosis_text(str(diag))
             if diag_str and not _PLACEHOLDER_PATTERNS.match(diag_str):
-                return _normalize(diag_str)
+                return _normalize(diag_str) if normalize else diag_str
 
     # 2. 旧 XML 格式
     all_diag = re.findall(
@@ -282,9 +291,9 @@ def parse_final_diagnosis(model_output: str) -> Optional[str]:
         re.IGNORECASE | re.DOTALL,
     )
     for raw in reversed(all_diag):
-        raw = raw.strip()
+        raw = _clean_diagnosis_text(raw)
         if raw and not _PLACEHOLDER_PATTERNS.match(raw):
-            return _normalize(raw)
+            return _normalize(raw) if normalize else raw
 
     # 3. ATPO 兼容格式
     fa_match = re.search(
@@ -321,13 +330,81 @@ def parse_question(model_output: str) -> Optional[str]:
 
 # ── 诊断匹配 ─────────────────────────────────────────────────────────────────
 
-def is_diagnosis_match(predicted: str, ground_truth: str, kg: Dict) -> bool:
+def is_single_diagnosis_candidate(predicted: str, kg: Dict) -> bool:
+    """
+    Reject differential-diagnosis style answers.
+
+    The reward should only accept one disease name or one KG-compatible alias,
+    not strings such as "pneumonia or bronchitis" or "possible ACS, PE, or MI".
+    Prompting asks for this, but reward-side validation is the real guardrail.
+    """
+    if not predicted:
+        return False
+
+    raw = _clean_diagnosis_text(predicted)
+    low = raw.lower()
+    norm = _normalize(raw)
+    if not norm:
+        return False
+
+    uncertainty_patterns = [
+        r"\bpossible\b",
+        r"\bprobable\b",
+        r"\bsuspected\b",
+        r"\blikely\b",
+        r"\bdifferential\b",
+        r"\brule\s*out\b",
+        r"\bversus\b",
+        r"\bvs\b",
+        r"\be\.g\.",
+        r"\bsuch\s+as\b",
+    ]
+    if any(re.search(p, low) for p in uncertainty_patterns):
+        return False
+
+    multi_patterns = [
+        r"\band\s*/\s*or\b",
+        r"\band\s+or\b",
+        r"\bor\b",
+        r"\bwith\s+possible\b",
+        r"\bcomplicated\s+by\b",
+        r"\bsecondary\s+to\b",
+        r"\bdue\s+to\b",
+        r"\bcaused\s+by\b",
+        r"[,;/]",
+    ]
+    if any(re.search(p, low) for p in multi_patterns):
+        return False
+
+    # Parentheses are allowed only for a single abbreviation/alias, e.g. COPD.
+    paren_contents = re.findall(r"\((.*?)\)", raw)
+    if len(paren_contents) > 1:
+        return False
+    if paren_contents:
+        inside = paren_contents[0].strip().lower()
+        if any(re.search(p, inside) for p in uncertainty_patterns + multi_patterns):
+            return False
+        without = re.sub(r"\([^)]*\)", "", raw).strip()
+        if not without:
+            return False
+
+    # Very long strings are almost always explanations or differential lists.
+    if len(norm.split()) > 8:
+        return False
+
+    return True
+
+
+def is_diagnosis_match(predicted: str, ground_truth: str, kg: Dict, strict_single: bool = True) -> bool:
     """
     判断预测诊断是否匹配 ground truth。
     支持：
     1. 精确规范化匹配
     2. KG 中疾病名模糊包含匹配
     """
+    if strict_single and not is_single_diagnosis_candidate(predicted, kg):
+        return False
+
     pred_norm = _normalize(predicted)
     gt_norm = _normalize(ground_truth)
 

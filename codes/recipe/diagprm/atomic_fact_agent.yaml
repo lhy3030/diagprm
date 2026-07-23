@@ -1,0 +1,12 @@
+- name: user_assistant_interaction
+  _target_: recipe.diagprm.atomic_fact_agent_loop.AtomicFactAgentLoop
+  max_turns: 10
+  max_turn_response_tokens: 1024
+  min_turn_response_tokens: 1
+  verifier_enabled: true
+  patient_api_base: "http://127.0.0.1:8100/v1"
+  patient_model: "Qwen3-8B"
+  patient_max_tokens: 512
+  patient_enable_thinking: false
+  prompt_style: "dataset"
+  doctor_enable_thinking: false

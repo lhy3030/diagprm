@@ -6,11 +6,11 @@
   # Set true only for KG-tool ablations.
   kg_tool_enabled: false
   # Patient simulator LLM API (OpenAI-compatible)
-  # Can also be set via environment variables: PATIENT_API_BASE, PATIENT_MODEL, PATIENT_API_KEY
-  # LongCat API（无需代理，集群直接可访问）
-  # API Key 通过环境变量 PATIENT_API_KEY 传入，避免硬编码
-  patient_api_base: "https://api.longcat.chat/openai/v1"
-  patient_model: "LongCat-2.0-Preview"
-  patient_max_tokens: 256
+  # 优先级：环境变量 PATIENT_API_BASE > 此处的 patient_api_base（见 diagprm_agent_loop.py）
+  # 使用 START_PATIENT_VLLM=1 启动本地 vLLM 时，PATIENT_API_BASE 会被自动设为节点真实 IP，
+  # 此处的值仅作 fallback（本地 vLLM 默认端口 8100）。
+  patient_api_base: "http://127.0.0.1:8100/v1"
+  patient_model: "Qwen3-8B"
+  patient_max_tokens: 512
   # 关闭思考模式：patient agent 不需要 CoT，节省 token 和延迟
   patient_enable_thinking: false

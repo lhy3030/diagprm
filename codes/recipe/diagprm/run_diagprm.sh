@@ -103,15 +103,40 @@ TRAIN_FILES="['${DIAGPRM_DATASET}/diagprm_train.parquet']"
 VAL_FILES="['${DIAGPRM_DATASET}/diagprm_val.parquet']"
 
 # ── 目录设置 ──────────────────────────────────────────────────────────────────
-# 每次启动生成时间戳，避免不同 run 的输出互相覆盖
+# 默认目录名为 {run_name}_{timestamp}，方便区分实验设置。
+# 兼容旧用法：如果外部已设置 RUN_ID=20260709_105318 这类纯时间戳，则保持不变。
 _RUN_TIMESTAMP="${_RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard/${_RUN_TIMESTAMP}}"
-export SAVE_CHECKPOINT_DIR="${SAVE_CHECKPOINT_DIR:-./checkpoints/diagprm/${_RUN_TIMESTAMP}}"
-export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm/${_RUN_TIMESTAMP}}"
+_RUN_NAME_RAW="${RUN_NAME:-${RUN_ID:-diagprm}}"
+if [[ "${_RUN_NAME_RAW}" =~ ^[0-9]{8}_[0-9]{6}$ ]] || [[ "${_RUN_NAME_RAW}" == *"_"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
+    _RUN_DIR_NAME="${_RUN_NAME_RAW}"
+else
+    _RUN_DIR_NAME="${_RUN_NAME_RAW}_${_RUN_TIMESTAMP}"
+fi
+export RUN_ID="${_RUN_DIR_NAME}"
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-./logs/tensorboard/${_RUN_DIR_NAME}}"
+export SAVE_CHECKPOINT_DIR="${SAVE_CHECKPOINT_DIR:-./checkpoints/diagprm/${_RUN_DIR_NAME}}"
+export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/diagprm/${_RUN_DIR_NAME}}"
+echo "[INFO] Run name:      ${_RUN_NAME_RAW}"
 echo "[INFO] Run timestamp: ${_RUN_TIMESTAMP}"
+echo "[INFO] Run id:        ${_RUN_DIR_NAME}"
 echo "[INFO] Output dir:    ${OUTPUT_DIR}"
 
 # HF 缓存已在上方统一设置（/data/run01），此处不再覆盖
+
+# ── Optional local patient vLLM server ────────────────────────────────────────
+# Set START_PATIENT_VLLM=1 to reserve one GPU for a local OpenAI-compatible
+# patient simulator before RL starts. TRAIN_CUDA_VISIBLE_DEVICES should contain
+# only the GPUs used by the trainer, e.g.:
+#   START_PATIENT_VLLM=1 PATIENT_VLLM_GPU=4 TRAIN_CUDA_VISIBLE_DEVICES=0,1,2,3
+PATIENT_VLLM_UTILS="${SCRIPT_DIR}/scripts/patient_vllm_utils.sh"
+if [ -f "${PATIENT_VLLM_UTILS}" ]; then
+    source "${PATIENT_VLLM_UTILS}"
+    start_patient_vllm_if_requested
+    trap stop_patient_vllm EXIT
+elif [ "${START_PATIENT_VLLM:-0}" = "1" ]; then
+    echo "[ERROR] START_PATIENT_VLLM=1 but utility script is missing: ${PATIENT_VLLM_UTILS}" >&2
+    exit 1
+fi
 
 # ── 模型路径（必填）──────────────────────────────────────────────────────────
 # 推荐：Qwen3-8B-Instruct 或 Qwen3-14B-Instruct
@@ -125,7 +150,10 @@ export KG_PATH="${KG_PATH:-${DIAGPRM_ROOT}/diagprm_dataset/clean_v2/clean_master
 # ── Patient Agent API Key（内部 aigc.sankuai.com 接口鉴权）──────────────────
 # 必须通过环境变量传入，避免硬编码到脚本中：
 export PATIENT_API_KEY="${PATIENT_API_KEY:-}"
-if [ -z "${PATIENT_API_KEY}" ]; then
+_PATIENT_API_BASE_FOR_CHECK="${PATIENT_API_BASE:-}"
+if [ -z "${PATIENT_API_KEY}" ] && \
+   [[ "${_PATIENT_API_BASE_FOR_CHECK}" != http://127.0.0.1* ]] && \
+   [[ "${_PATIENT_API_BASE_FOR_CHECK}" != http://localhost* ]]; then
     echo "[WARN] PATIENT_API_KEY is not set. Patient API calls will fail without auth."
     echo "[WARN] Run: export PATIENT_API_KEY=<your_token>  before starting training."
 fi
@@ -165,7 +193,11 @@ elif [ "${N_GPUS}" -le 4 ]; then
     : "${TRAIN_BATCH_SIZE_OVERRIDE:=8}"
     : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=8}"
     : "${AGENT_NUM_WORKERS_OVERRIDE:=4}"
-    : "${INFER_TP_OVERRIDE:=2}"
+    if [ $((N_GPUS % 2)) -eq 0 ]; then
+        : "${INFER_TP_OVERRIDE:=2}"
+    else
+        : "${INFER_TP_OVERRIDE:=1}"
+    fi
 else
     : "${TRAIN_BATCH_SIZE_OVERRIDE:=16}"
     : "${PPO_MINI_BATCH_SIZE_OVERRIDE:=16}"
@@ -183,7 +215,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # ── 对话超参 ──────────────────────────────────────────────────────────────────
-max_turns=${MAX_TURNS_OVERRIDE:-10}  # 最大问诊轮数
+max_turns=${MAX_TURNS_OVERRIDE:-6}  # 最大问诊轮数
 max_prompt_length=1024
 max_response_length=4096  # 单轮 response 上限；多轮对话每轮约 300-600 token，4096 避免截断
 actor_lr=1e-6
@@ -202,7 +234,9 @@ train_sp=1
 offload=True
 # actor_max_token_len_per_gpu：控制 actor update 时单卡最长 token 数
 # = (prompt + response) * G，8卡G=8: (1024+4096)*8 = 40960（开启 offload 可承受）
-actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * n_resp_per_prompt ))
+# multi-turn 场景实际序列更长，可通过 PPO_MAX_TOKEN_LEN_OVERRIDE 覆盖
+_default_max_token_len=$(( (max_prompt_length + max_response_length) * n_resp_per_prompt ))
+actor_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_OVERRIDE:-${_default_max_token_len}}
 # log_prob 只需 forward pass，显存更小，保持 1x 即可
 log_prob_max_token_len_per_gpu=${actor_max_token_len_per_gpu}
 
@@ -210,20 +244,23 @@ log_prob_max_token_len_per_gpu=${actor_max_token_len_per_gpu}
 # 奖励结构：r(k) = turn_coef * r_turn(k) + r_diag(k)
 #   r_turn(k) = Δ_kg
 #   r_diag(k) = 确诊奖励（仅最后轮）
-beta=1.0         # KG 覆盖率差分系数（r_turn 内部）
-turn_coef=1.0    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
-r_max=${R_MAX_OVERRIDE:-2.0}        # 最大确诊奖励
+beta=${BETA_OVERRIDE:-1.0}         # KG 覆盖率差分系数（r_turn 内部）
+turn_coef=${TURN_COEF_OVERRIDE:-0.4}    # Turn 奖励总系数（调节 r_turn 相对于 r_diag 的权重）
+weighted=${WEIGHTED_OVERRIDE:-false}    # false = 每个 KG fact 等权；true = 使用 KG 内 fact weight
+r_max=${R_MAX_OVERRIDE:-1.0}        # 正确诊断奖励
 tau=${TAU_OVERRIDE:-0.5}            # 过早确诊阈值
 min_new_facts_for_diagnosis=${MIN_NEW_FACTS_FOR_DIAGNOSIS_OVERRIDE:-2}  # 正确诊断拿满分前至少需要新增确认事实数
-r_premature_diag=${R_PREMATURE_DIAG_OVERRIDE:-0.0}  # 正确但证据不足/过早诊断的最终奖励
-r_wrong_diag=${R_WRONG_DIAG_OVERRIDE:--1.0}
-r_timeout=${R_TIMEOUT_OVERRIDE:--1.0}
+r_premature_diag=${R_PREMATURE_DIAG_OVERRIDE:-0.0}  # 兼容旧配置；不再影响 correct reward
+r_wrong_diag=${R_WRONG_DIAG_OVERRIDE:-0.0}
+r_timeout=${R_TIMEOUT_OVERRIDE:--2.0}
 
 # ── GiGPO 混合系数 ─────────────────────────────────────────────────────────────
-# Â(k) = Â_turn(k) + alpha * Â_diag
-#   alpha=0 → 纯 turn 级归一化（无轨迹级信号）
-#   alpha=1 → turn 级 + 等权轨迹级混合
+# 兼容旧配置名 alpha；语义是 omega / turn auxiliary weight：
+# Â(k) = Â_diag + alpha * Â_turn(k)
+#   alpha=0   → outcome-only / 轨迹级诊断信号
+#   alpha=0.5 → 诊断正确性主导 + KG turn shaping
 alpha=${ALPHA_OVERRIDE:-0.5}
+terminal_diag_coef=${TERMINAL_DIAG_COEF_OVERRIDE:-1.2}
 
 echo "============================================================"
 echo "  DiagPRM Training"
@@ -235,6 +272,11 @@ echo "  G (rollouts per prompt): ${n_resp_per_prompt}"
 echo "  prompt batch size: ${train_batch_size}"
 echo "  rollout batch size: $(( train_batch_size * n_resp_per_prompt ))"
 echo "  max_turns: ${max_turns}"
+echo "  beta / turn_coef: ${beta} / ${turn_coef}"
+echo "  advantage mix: A_diag + ${alpha} * A_turn"
+echo "  terminal diagnose coef: ${terminal_diag_coef}"
+echo "  weighted KG coverage: ${weighted}"
+echo "  r_max / r_wrong / r_timeout: ${r_max} / ${r_wrong_diag} / ${r_timeout}"
 echo "============================================================"
 
 python3 -m recipe.diagprm.diagprm_main \
@@ -309,9 +351,10 @@ python3 -m recipe.diagprm.diagprm_main \
     reward_coefficients.r_premature_diag=${r_premature_diag} \
     reward_coefficients.r_wrong_diag=${r_wrong_diag} \
     reward_coefficients.r_timeout=${r_timeout} \
-    reward_coefficients.weighted=True \
+    reward_coefficients.weighted=${weighted} \
     \
     algorithm.diagprm_alpha=${alpha} \
+    algorithm.terminal_diag_coef=${terminal_diag_coef} \
     \
     critic.enable=False \
     \
@@ -328,7 +371,7 @@ python3 -m recipe.diagprm.diagprm_main \
     trainer.critic_warmup=0 \
     trainer.val_before_train=True \
     trainer.log_val_generations=0 \
-    trainer.save_freq=10 \
+    trainer.save_freq=30 \
     trainer.test_freq=10 \
     trainer.total_epochs=3 \
     trainer.default_local_dir=${SAVE_CHECKPOINT_DIR} \

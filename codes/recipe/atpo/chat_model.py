@@ -43,7 +43,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 async def decode_assistant_response(responses_ids: list[int], tokenizer) -> str:
     loop = asyncio.get_running_loop()
-    content = await loop.run_in_executor(None, tokenizer.decode, responses_ids)
+    content = await loop.run_in_executor(
+        None,
+        lambda: tokenizer.decode(responses_ids, skip_special_tokens=True),
+    )
 
     return content
 
@@ -75,6 +78,9 @@ class ChatModel(BaseChatModel):
     repetition_penalty: float = 1.0
     """Repetition penalty for sampling"""
 
+    enable_thinking: Optional[bool] = None
+    """Optional Qwen chat-template thinking switch."""
+
 
     def with_structured_output(
         self,
@@ -94,20 +100,20 @@ class ChatModel(BaseChatModel):
     ) -> ChatResult:
         raise NotImplementedError
 
-    def _apply_chat_template(self, messages: list[dict], *, add_generation_prompt: bool = True) -> list[int]:
+    def _apply_chat_template(
+        self, messages: list[dict], *, add_generation_prompt: bool = True
+    ) -> list[int]:
+        kwargs = {
+            "add_generation_prompt": add_generation_prompt,
+            "tokenize": True,
+        }
+        if self.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.enable_thinking
         try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=True,
-                enable_thinking=False,
-            )
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
         except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=True,
-            )
+            kwargs.pop("enable_thinking", None)
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     async def _agenerate(
         self,
@@ -177,9 +183,9 @@ class ChatModel(BaseChatModel):
         # Case 1: initial chat completion: [system], human
         if messages[-1].type == "human" and len(messages) == 2:
             prompt_ids = await loop.run_in_executor(
-                    None,
-                    lambda: self._apply_chat_template(convert_to_openai_messages(messages)),
-                )
+                None,
+                lambda: self._apply_chat_template(convert_to_openai_messages(messages)),
+            )
             return str(uuid.uuid4()), prompt_ids, []
 
         # Case 2: follow up chat completion with human response: [system], human, ai, human, ...
@@ -196,7 +202,8 @@ class ChatModel(BaseChatModel):
         human_responses = convert_to_openai_messages(messages[i + 1 :])
         human_response_ids = await loop.run_in_executor(
             None,
-            lambda messages=human_responses: self.tokenizer.encode('\n') + self._apply_chat_template(messages),
+            lambda messages=human_responses: self.tokenizer.encode('\n')
+            + self._apply_chat_template(messages),
         )
 
         # stop generation if response length exceeds max response length

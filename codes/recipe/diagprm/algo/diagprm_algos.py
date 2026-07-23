@@ -3,24 +3,22 @@ DiagPRM - Turn-level GRPO Advantage Estimator（GiGPO 风格两层 Grouping）
 
 核心思想（来自 proposal §3.6）：
 
-  奖励结构：
-    r(k) = turn_coef * r_turn(k) + r_diag
-    r_turn(k) = Δ_k^kg
-
   两层归一化（GiGPO 风格）：
     ① Turn-position Group（Turn 级别）：
-       - 同一 uid（prompt）下，所有 rollout 中相同 turn 位置的 r_turn(k)，
+       - 同一 uid（prompt）下，所有 rollout 中相同 turn 位置的 ask 动作 Δ_k^kg，
          归入同一 group，在组内做均值/方差归一化 -> A_turn(k)
        - 直觉：在相同问诊阶段，哪些问题带来更多新增证据？
+       - diagnose / 非 ask 动作不参与 KG-delta group，A_turn 置 0，只吃 A_diag
     ② 轨迹 Group（Episode 级别）：
        - 同一 uid（prompt）下，所有 rollout 的最终 r_diag，
          跨 rollout 做均值/方差归一化 → Â_diag
        - 直觉：哪条完整轨迹诊断结果更好？
 
   GiGPO 风格混合：
-    A(k) = A_turn(k) + alpha * A_diag
-    - 每一轮的最终 advantage 是 turn 级信号 + 轨迹级信号的加权和
-    - α 默认 0.5，可通过 alpha 参数调节
+    A(k) = A_diag + omega * A_turn(k)
+    - 轨迹/诊断正确性是主信号；turn-level KG progress 是辅助 shaping 信号
+    - diagnose turn 使用 terminal_diag_coef * A_diag，以强调最终诊断动作
+    - 代码中为兼容旧配置仍使用参数名 alpha，但语义是 omega（turn weight）
 
 与标准 GRPO 的区别：
   - 标准 GRPO：整条轨迹所有 token 共享同一个 scalar advantage
@@ -30,7 +28,9 @@ DiagPRM - Turn-level GRPO Advantage Estimator（GiGPO 风格两层 Grouping）
 adv_compute_info 格式（由 DiagPRMRewardManager 生成）：
   {
     "turn_end_positions": List[int],
-    "turn_process_rewards": List[float],   # r(k) = turn_coef*r_turn + r_diag（已合并）
+    "turn_process_rewards": List[float],   # 兼容旧日志：r(k) = turn_coef*r_turn + r_diag
+    "turn_delta_kg_rewards": List[float],  # 推荐：每轮原始 Delta_KG，用于 A_turn
+    "turn_actions": List[str],             # ask / diagnose；A_turn only for ask
     "outcome_reward": float,               # 最终轮 r_diag
   }
 """
@@ -49,7 +49,8 @@ def compute_diagprm_turn_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std: bool = True,
     adv_compute_info: Optional[list] = None,  # List[dict]，由 reward manager 生成
-    alpha: float = 0.5,                   # GiGPO 混合系数：Â = Â_turn + alpha * Â_diag
+    alpha: float = 0.5,                   # GiGPO omega：Â = Â_diag + omega * Â_turn
+    terminal_diag_coef: float = 1.2,       # Diagnose turn: Â = terminal_diag_coef * Â_diag
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     GiGPO 风格两层 Grouping 的 Turn-level GRPO Advantage 计算。
@@ -66,14 +67,19 @@ def compute_diagprm_turn_advantage(
         adv_compute_info: List[dict]，每个样本对应一个 dict：
             {
               "turn_end_positions": List[int],
-              "turn_process_rewards": List[float],  # 已含 turn_coef*r_turn + r_diag
+              "turn_process_rewards": List[float],  # 兼容旧日志：已含 turn_coef*r_turn + r_diag
+              "turn_delta_kg_rewards": List[float], # 推荐：每轮原始 Delta_KG
+              "turn_actions": List[str],             # ask / diagnose
               "outcome_reward": float,
             }
             如果为 None，退化为标准 outcome-only GRPO。
-        alpha: GiGPO 混合系数，控制轨迹级信号 Â_diag 的权重。
-            Â(k) = Â_turn(k) + alpha * Â_diag
-            - alpha=0.0 → 纯 turn 级信号
-            - alpha=1.0 → 等权混合
+        alpha: 兼容旧配置名；语义是 GiGPO omega，控制 turn-level 辅助信号权重。
+            Â(k) = Â_diag + alpha * Â_turn(k)
+            - alpha=0.0 → outcome-only / 轨迹级诊断信号
+            - alpha=0.5 → 诊断主导 + KG turn shaping
+        terminal_diag_coef: diagnose turn 的 A_diag 放大系数。
+            ask:      Â(k) = Â_diag + alpha * Â_turn(k)
+            diagnose: Â(k) = terminal_diag_coef * Â_diag
 
     Returns:
         advantages: shape (bs, response_length)
@@ -94,25 +100,28 @@ def compute_diagprm_turn_advantage(
         # ══════════════════════════════════════════════════════════════════════
         # Step 1：按 uid 分组，提取每条轨迹的 turn 信息
         # ══════════════════════════════════════════════════════════════════════
-        # uid2samples: {uid: [(sample_idx, turn_end_positions, turn_rewards, outcome_reward, hypotheses)]}
+        # uid2samples: {uid: [(sample_idx, turn_end_positions, turn_rewards, outcome_reward, hypotheses, actions)]}
         uid2samples = defaultdict(list)
         for sample_idx in range(bsz):
             uid = index[sample_idx]
             info = adv_compute_info[sample_idx]
             turn_end_positions = info.get("turn_end_positions", [])
             turn_process_rewards = info.get("turn_process_rewards", [])
+            turn_delta_kg_rewards = info.get("turn_delta_kg_rewards", None)
             outcome_reward = info.get("outcome_reward", 0.0)
             # 旧 hypothesis 分组字段。主方法不传该字段，因此按 turn index 分组。
             turn_hypotheses = info.get("turn_hypotheses", None)
+            turn_actions = info.get("turn_actions", None)
 
-            # 从 turn_process_rewards 中分离 r_turn 和 r_diag：
-            # turn_process_rewards[k] = turn_coef * r_turn(k) + r_diag(k)
-            # 对于非最终轮，r_diag(k) = 0，所以 r_turn_val = turn_process_rewards[k]
-            # 对于最终轮，r_diag = outcome_reward，r_turn_val = turn_process_rewards[-1] - outcome_reward
-            r_turn_values = list(turn_process_rewards)
-            if r_turn_values:
-                # 最后一轮去掉 r_diag，还原纯 r_turn 部分
-                r_turn_values[-1] = r_turn_values[-1] - outcome_reward
+            # 优先使用 reward manager 提供的原始 Delta_KG 作为 A_turn 的输入。
+            # 这让 turn_coef 只影响日志/标量 reward，不再隐式改变 normalized advantage。
+            if turn_delta_kg_rewards is not None:
+                r_turn_values = list(turn_delta_kg_rewards)
+            else:
+                # 兼容旧日志：从 turn_process_rewards 中分离 turn signal 和 final outcome。
+                r_turn_values = list(turn_process_rewards)
+                if r_turn_values:
+                    r_turn_values[-1] = r_turn_values[-1] - outcome_reward
 
             uid2samples[uid].append((
                 sample_idx,
@@ -120,6 +129,7 @@ def compute_diagprm_turn_advantage(
                 r_turn_values,
                 outcome_reward,
                 turn_hypotheses,
+                turn_actions,
             ))
 
         # ══════════════════════════════════════════════════════════════════════
@@ -134,7 +144,7 @@ def compute_diagprm_turn_advantage(
         for uid, samples in uid2samples.items():
             if len(samples) == 1:
                 # 只有一个 rollout：turn advantage = 0（组内无法对比）
-                sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps = samples[0]
+                sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps, actions = samples[0]
                 for t_idx in range(len(r_turn_values)):
                     adv_turn_map[(sample_idx, t_idx)] = 0.0
                     # 同样写入 advantage tensor，保证 token 区间有明确值（0.0）
@@ -151,8 +161,15 @@ def compute_diagprm_turn_advantage(
             # 结构：group_key → [(sample_idx, turn_idx, r_turn_val)]
             hyp_group: dict = defaultdict(list)
 
-            for sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps in samples:
+            for sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps, actions in samples:
                 for t_idx, r_turn_val in enumerate(r_turn_values):
+                    if actions is not None and t_idx < len(actions):
+                        action = str(actions[t_idx] or "").lower()
+                        if action != "ask":
+                            # KG progress is an information-gathering reward.
+                            # Terminal diagnose turns are optimized by A_diag.
+                            adv_turn_map[(sample_idx, t_idx)] = 0.0
+                            continue
                     if hyps is not None and t_idx < len(hyps):
                         # 假设感知分组：同一 hypothesis 下的所有 turn 放一组
                         hyp_key = hyps[t_idx] if hyps[t_idx] else f"__unknown_{t_idx}"
@@ -208,17 +225,26 @@ def compute_diagprm_turn_advantage(
                 adv_diag_map[s_idx] = float(adv_val)
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 4：GiGPO 混合 → Â(k) = Â_turn(k) + alpha * Â_diag
+        # Step 4：GiGPO 混合 → Â(k) = Â_diag + omega * Â_turn(k)
         #         并将 advantage 填充到对应的 token 区间
         # ══════════════════════════════════════════════════════════════════════
         for uid, samples in uid2samples.items():
-            for sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps in samples:
+            for sample_idx, turn_end_pos, r_turn_values, outcome_reward, hyps, actions in samples:
                 adv_diag = adv_diag_map.get(sample_idx, 0.0)
 
                 for t_idx, end_pos in enumerate(turn_end_pos):
                     adv_turn = adv_turn_map.get((sample_idx, t_idx), 0.0)
-                    # GiGPO 混合公式
-                    final_adv = adv_turn + alpha * adv_diag
+                    action = ""
+                    if actions is not None and t_idx < len(actions):
+                        action = str(actions[t_idx] or "").lower()
+                    if action in {"diagnose", "answer", "final_answer"}:
+                        # Terminal decision is the core prediction.
+                        # In diagnostic dialogue this is "diagnose"; in ATPO-style
+                        # medical QA this is "answer".
+                        final_adv = terminal_diag_coef * adv_diag
+                    else:
+                        # alpha 保持旧配置名；语义是 omega / turn auxiliary weight。
+                        final_adv = adv_diag + alpha * adv_turn
                     # 通过 turn_end_pos 列表精确推算本 turn 的起始位置：
                     # 本 turn start = 前一个 turn end + 1（跳过中间的 human token 段由 response_mask 决定）
                     prev_end = turn_end_pos[t_idx - 1] if t_idx > 0 else -1
